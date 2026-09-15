@@ -30,7 +30,7 @@ use openshell_core::proto::{
     open_shell_server::{OpenShell, OpenShellServer},
 };
 use openshell_server::{MultiplexedService, Store, TlsAcceptor, health_router};
-use rcgen::{CertificateParams, IsCa, KeyPair};
+use rcgen::{CertificateParams, IsCa};
 use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
 use rustls_pemfile::certs;
@@ -705,7 +705,7 @@ pub fn generate_pki() -> (tempfile::TempDir, PkiBundle) {
     ca_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "test-ca");
-    let ca_key = KeyPair::generate().expect("failed to generate CA key");
+    let ca_key = openshell_crypto::pki::generate_keypair().expect("failed to generate CA key");
     let ca_cert = ca_params
         .self_signed(&ca_key)
         .expect("failed to sign CA cert");
@@ -713,7 +713,8 @@ pub fn generate_pki() -> (tempfile::TempDir, PkiBundle) {
     // Generate server cert signed by CA
     let server_params = CertificateParams::new(vec!["localhost".to_string()])
         .expect("failed to create server params");
-    let server_key = KeyPair::generate().expect("failed to generate server key");
+    let server_key =
+        openshell_crypto::pki::generate_keypair().expect("failed to generate server key");
     let server_cert = server_params
         .signed_by(&server_key, &ca_cert, &ca_key)
         .expect("failed to sign server cert");
@@ -724,7 +725,8 @@ pub fn generate_pki() -> (tempfile::TempDir, PkiBundle) {
     client_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "test-client");
-    let client_key = KeyPair::generate().expect("failed to generate client key");
+    let client_key =
+        openshell_crypto::pki::generate_keypair().expect("failed to generate client key");
     let client_cert = client_params
         .signed_by(&client_key, &ca_cert, &ca_key)
         .expect("failed to sign client cert");
@@ -803,7 +805,8 @@ pub fn generate_rogue_pki() -> RoguePkiBundle {
     rogue_ca_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "rogue-ca");
-    let rogue_ca_key = KeyPair::generate().expect("failed to generate rogue CA key");
+    let rogue_ca_key =
+        openshell_crypto::pki::generate_keypair().expect("failed to generate rogue CA key");
     let rogue_ca_cert = rogue_ca_params
         .self_signed(&rogue_ca_key)
         .expect("failed to sign rogue CA cert");
@@ -813,7 +816,8 @@ pub fn generate_rogue_pki() -> RoguePkiBundle {
     rogue_client_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "rogue-client");
-    let rogue_client_key = KeyPair::generate().expect("failed to generate rogue client key");
+    let rogue_client_key =
+        openshell_crypto::pki::generate_keypair().expect("failed to generate rogue client key");
     let rogue_client_cert = rogue_client_params
         .signed_by(&rogue_client_key, &rogue_ca_cert, &rogue_ca_key)
         .expect("failed to sign rogue client cert");
