@@ -147,11 +147,11 @@ mod tests {
     // from effective policy rather than trusting persisted owner stamps.
     // Operator credential export adds four public messages and no durable types.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "5ae8334d9f6212a00c38ba965ff62e567d2846b15f4df8faf85954023da542e7";
+        "1e7c8161db3080f8d751fd30ad47aa6c80a5bb3b47c039cdf4f8b1440e349091";
     const DURABLE_SCHEMA_SHA256: &str =
-        "5281143e2825539af6148785c91f9df67f654eb74d215f57940af9314867a55f";
+        "d123931bc3ff7dd3be871ce4d51aa23486c7860424353be3d2a6b033e50ed97e";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
+        "4710c85fc70c7049abd35952bedbc271d614166af27984d27e22af567ae6cf02";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -619,9 +619,11 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (311, 27),
-                (93, 21),
-                (81, 21),
+                // HttpReadinessCheck is durable endpoint configuration;
+                // ServiceHealth and its enum are public observations only.
+                (313, 28),
+                (94, 21),
+                (82, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
