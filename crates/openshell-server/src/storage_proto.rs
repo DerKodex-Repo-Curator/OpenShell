@@ -147,9 +147,9 @@ mod tests {
     // from effective policy rather than trusting persisted owner stamps.
     // Operator credential export adds four public messages and no durable types.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "83be88b4b1c19ce3d58ae92a1fed8220f5843c85774b71eabfbf1a8ce86b58e5";
+        "e79949fc56607199a9c58b5cd07be41f7c8f54f79e872f2da08e4a2e685a8d04";
     const DURABLE_SCHEMA_SHA256: &str =
-        "d123931bc3ff7dd3be871ce4d51aa23486c7860424353be3d2a6b033e50ed97e";
+        "6a546dd04f8bcf580a187b82418da8b1fb35314db496e26855ba6543084ff273";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "4710c85fc70c7049abd35952bedbc271d614166af27984d27e22af567ae6cf02";
     // Encoded with the schema that omitted stable_placeholder. Keep these
