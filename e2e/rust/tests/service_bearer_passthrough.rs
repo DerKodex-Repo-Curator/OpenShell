@@ -373,6 +373,7 @@ async fn service_readiness_continuously_observes_application_without_gating_rout
     let name = format!("svc-ready-{}", std::process::id());
     let server = r#"
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import time
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/toggle':
@@ -382,8 +383,15 @@ class Handler(BaseHTTPRequestHandler):
             ready = self.path == '/readyz' and getattr(self.server, 'ready', True)
             status = 200 if ready and not self.headers.get('Authorization') else 503
         self.send_response(status)
-        self.send_header('Content-Length', '0')
+        body = b'x' * (128 * 1024)
+        self.send_header('Content-Length', str(len(body)))
         self.end_headers()
+        self.wfile.flush()
+        time.sleep(0.2)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
     def log_message(self, *_args):
         pass
 ThreadingHTTPServer(('127.0.0.1', 4500), Handler).serve_forever()
@@ -438,6 +446,23 @@ ThreadingHTTPServer(('127.0.0.1', 4500), Handler).serve_forever()
         !logs.contains("tcp relay open"),
         "health probes must not emit relay audit events: {logs}"
     );
+    let gateway_logs = run_cli(&[
+        "logs", &name, "--source", "gateway", "--level", "warn", "-n", "200",
+    ])
+    .await
+    .unwrap();
+    assert!(gateway_logs.status.success());
+    let gateway_logs = String::from_utf8_lossy(&gateway_logs.stdout);
+    for warning in [
+        "write to duplex failed",
+        "inbound errored",
+        "write to supervisor relay failed",
+    ] {
+        assert!(
+            !gateway_logs.contains(warning),
+            "header-only probes must close quietly: {gateway_logs}"
+        );
+    }
 
     let mut control =
         ServiceTarget::from_url(created["service_urls"][""].as_str().unwrap()).unwrap();
