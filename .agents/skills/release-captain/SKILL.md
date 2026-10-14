@@ -302,6 +302,7 @@ Finish these on Monday so Tuesday is only the cut.
 |---|---|
 | Transient infrastructure failure in a pre-release | After approval, run `gh run rerun <run-id> --failed`, then recheck the new attempt's summary. |
 | Code defect in a pre-release | Merge the fix. Let Auto-Tag create the next `-pre.N`, or, after approval, tag and push one by hand. |
+| `Cargo Deny` fails a pre-release with `error[vulnerability]` | A new RustSec advisory was published against a locked dependency. Code that passed earlier can start failing this way. Rerunning won't help. Find the advisory IDs with `gh run view <run-id> --log-failed \| grep -E 'ID: RUSTSEC'`, look for an open dependency bump PR, and treat the merged bump as a code-defect fix. |
 | A pushed tag started no `Release Tag` run | Wait a few minutes and check `gh run list --workflow release-tag.yml --branch "$TAG"` again. Only after confirming that no run exists, and with approval, dispatch it with `gh workflow run release-tag.yml --ref main -f tag="$TAG"`. |
 | Stable run stuck queued | Don't re-dispatch or delete the tag. Check for a GitHub Actions incident and ask a maintainer to cancel the run (`gh run cancel <run-id>`, or force-cancel through the API). Only after it shows `cancelled` or `failed`, rerun it after approval. |
 | Stable run fails before the `Release` job, transient | Nothing was published. After approval, run `gh run rerun <run-id> --failed`. |
