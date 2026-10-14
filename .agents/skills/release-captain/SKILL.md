@@ -64,6 +64,11 @@ echo "Latest stable: $PREV"
 git tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-pre\.[0-9]+$' | head -5
 ```
 
+Release tags are lightweight, matching the tags Auto-Tag creates. The tag
+commands below pass `-c tag.gpgSign=false` and read from `/dev/null`. With
+`tag.gpgSign` set, `git tag` would otherwise create a signed annotated tag and
+wait in an editor for a message.
+
 Find the `Release Tag` run for a tag. A tag pushed by hand runs on the tag
 itself. An Auto-Tag run is dispatched on `main`, so its head commit is the
 tagged commit:
@@ -179,7 +184,7 @@ Finish these on Monday so Tuesday is only the cut.
    [[ "$VERSION" == "${TAG%-pre.*}" ]] || echo "version does not match the train"
    [[ "$SHA" == "$(jq -r .source_sha "$dir/q/qualification-summary.json")" ]] || echo "commit does not match qualification"
    git tag --points-at "$SHA" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' && echo "commit already has a stable tag"
-   git tag "$VERSION" "$SHA"
+   git -c tag.gpgSign=false tag "$VERSION" "$SHA" </dev/null
    git push origin "refs/tags/$VERSION"
    ```
 
@@ -251,7 +256,7 @@ Finish these on Monday so Tuesday is only the cut.
    NEXT_SHA=<main commit>
    git merge-base --is-ancestor "$VERSION" "$NEXT_SHA" || echo "commit does not contain the release"
    git tag --points-at "$NEXT_SHA" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' && echo "commit already has a stable tag"
-   git tag "$NEXT" "$NEXT_SHA"
+   git -c tag.gpgSign=false tag "$NEXT" "$NEXT_SHA" </dev/null
    git push origin "refs/tags/$NEXT"
    gh run list --workflow release-tag.yml --branch "$NEXT"
    ```
