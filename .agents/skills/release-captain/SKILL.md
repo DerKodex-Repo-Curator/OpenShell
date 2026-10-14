@@ -43,9 +43,10 @@ tags; the RFC's cleanup step is not implemented and tag deletion is restricted.
   dispatches `Release Tag` (about 45 minutes). It skips after the base version
   gets a stable tag, and fails if the latest pre-release isn't an ancestor of
   `main`.
-- Pushing a `-pre.*` tag does not start `Release Tag`. A pre-release tagged by
-  hand must be dispatched.
-- Pushing a stable `vX.Y.Z` tag starts `Release Tag`, which rebuilds and
+- Pushing any release tag by hand, pre-release or stable, starts `Release Tag`.
+  Don't also dispatch it, or two runs race to publish. Auto-Tag dispatches
+  explicitly only because its `GITHUB_TOKEN` push can't trigger workflows.
+- A stable `vX.Y.Z` tag push rebuilds and
   requalifies the commit. Codex Security runs only for pre-releases, so the
   stable release relies on the selected pre-release's security result. Always
   tag the commit of a pre-release that passed.
@@ -63,16 +64,18 @@ echo "Latest stable: $PREV"
 git tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-pre\.[0-9]+$' | head -5
 ```
 
-Find the `Release Tag` run for a pre-release. Dispatched runs use `main`, so
-their head commit is the tagged commit:
+Find the `Release Tag` run for a tag. A tag pushed by hand runs on the tag
+itself. An Auto-Tag run is dispatched on `main`, so its head commit is the
+tagged commit:
 
 ```shell
 TAG=vX.Y.Z-pre.N
+gh run list --workflow release-tag.yml --branch "$TAG"
 gh run list --workflow release-tag.yml --event workflow_dispatch --commit "$(git rev-parse "$TAG^{commit}")"
 ```
 
-If that commit has several runs, the one whose Codex Security job name contains
-`($TAG)` is the match. That job appears only after the images build.
+If a commit has several dispatched runs, the one whose Codex Security job name
+contains `($TAG)` is the match. That job appears only after the images build.
 
 ## Monday: pre-flight
 
@@ -204,20 +207,44 @@ Finish these on Monday so Tuesday is only the cut.
    `Trigger Wheel Publish` only starts the GitLab pipeline, so confirm that the
    Python wheel reached PyPI separately.
 
-6. **Start the next train.** Auto-Tag waits until the next `-pre.1` exists.
+6. **Start the next train.** Until someone pushes the next `-pre.1`, Auto-Tag
+   logs `vX.Y.Z is already stable — skipping tag creation` and does nothing.
+   Start the train soon after the stable release; it can be any weekday.
+
    Agree with the maintainers whether the next train is patch (the default) or
    minor (notable features or planned breaking changes; see the
    [version selection supplement](../../../rfc/0014-release-stability/release-version-selection.md)).
+   List the commit types since the release to inform the decision:
+
+   ```shell
+   git log --format=%s --no-merges "$VERSION..origin/main" | sed -E 's/^([a-z]+)(\(.*\))?(!?):.*/\1\3/' | sort | uniq -c
+   ```
 
    Seed the train on a `main` commit that:
 
    - comes after `$VERSION`;
-   - has green branch checks;
-   - has no stable tag of its own.
+   - has no stable tag of its own;
+   - has a successful `Release Dev` run.
 
    Release versioning prefers a stable tag over a pre-release tag on the same
    commit, which would mislabel the packages. If nothing has merged since the
-   release, wait. After approval:
+   release, wait.
+
+   Branch Checks already passed in the merge queue before each merge.
+   `Release Dev` runs the post-merge E2E and dev publication on every commit. A
+   newer push cancels the older run, so `cancelled` means superseded, not
+   failed. Pick the newest commit whose run succeeded, or wait for the tip's
+   run to finish:
+
+   ```shell
+   for sha in $(git rev-list --max-count=10 "$VERSION..origin/main"); do
+     state=$(gh run list --workflow release-dev.yml --commit "$sha" --json status,conclusion --jq '.[0] | if .status == "completed" then .conclusion else .status end')
+     echo "${sha:0:9} ${state:-none} $(git log -1 --format=%s "$sha")"
+   done
+   ```
+
+   After approval, push the tag. The push starts `Release Tag`; don't dispatch
+   it as well:
 
    ```shell
    NEXT=vX.Y.Z-pre.1
@@ -226,8 +253,12 @@ Finish these on Monday so Tuesday is only the cut.
    git tag --points-at "$NEXT_SHA" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' && echo "commit already has a stable tag"
    git tag "$NEXT" "$NEXT_SHA"
    git push origin "refs/tags/$NEXT"
-   gh workflow run release-tag.yml --ref main -f tag="$NEXT"
+   gh run list --workflow release-tag.yml --branch "$NEXT"
    ```
+
+   Stop if either check prints a message. When the run finishes, read its
+   qualification summary (Monday step 2). From the next weekday, Auto-Tag
+   creates `-pre.2` onward when `main` has new commits.
 
 7. **Close the loop.** Draft a reply to the coordination thread with the release
    link and any PRs deferred to the next train.
@@ -237,14 +268,17 @@ Finish these on Monday so Tuesday is only the cut.
 | Symptom | Action |
 |---|---|
 | Transient infrastructure failure in a pre-release | After approval, run `gh run rerun <run-id> --failed`, then recheck the new attempt's summary. |
-| Code defect in a pre-release | Merge the fix. Let Auto-Tag create the next `-pre.N`, or, after approval, tag one by hand and dispatch it. |
+| Code defect in a pre-release | Merge the fix. Let Auto-Tag create the next `-pre.N`, or, after approval, tag and push one by hand. |
+| A pushed tag started no `Release Tag` run | Wait a few minutes and check `gh run list --workflow release-tag.yml --branch "$TAG"` again. Only after confirming that no run exists, and with approval, dispatch it with `gh workflow run release-tag.yml --ref main -f tag="$TAG"`. |
 | Stable run stuck queued | Don't re-dispatch or delete the tag. Check for a GitHub Actions incident and ask a maintainer to cancel the run (`gh run cancel <run-id>`, or force-cancel through the API). Only after it shows `cancelled` or `failed`, rerun it after approval. |
 | Stable run fails before the `Release` job, transient | Nothing was published. After approval, run `gh run rerun <run-id> --failed`. |
 | Stable run fails before the `Release` job, code defect | Nothing was published, and Auto-Tag won't create pre-releases for a base version that has a stable tag. Ask the maintainers to choose: remove the unpublished tag (needs a ruleset bypass) and recut from a qualified fix, or skip to the next patch version. |
-| Stable run fails after the `Release` job | The GitHub Release exists. Check which publish jobs succeeded. A rerun of an npm or Snap publish fails if that version already went out. Rerun only jobs that didn't publish, after approval. |
+| Stable run fails after the `Release` job | The GitHub Release exists. Check which publish jobs succeeded. A rerun of an npm or snap publish fails if that version already went out. Rerun only jobs that didn't publish, after approval. |
 
 ## Related
 
+- `release-openshell`: the short procedure for selecting a qualified
+  pre-release and tagging it stable.
 - `watch-github-actions`: general `gh run` monitoring and log retrieval.
 - `test-release-canary`: diagnose dev artifact smoke-test failures.
 - `CI.md`: release workflows, qualification profile, and scanner policies.
