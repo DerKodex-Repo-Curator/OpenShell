@@ -164,8 +164,18 @@ Finish these on Monday so Tuesday is only the cut.
    gh run list --workflow release-canary.yml --limit 3
    ```
 
-5. **Plan fixes.** A transient infrastructure failure can be rerun after
-   approval. A code defect needs a merged fix and a new pre-release.
+5. **Plan fixes.** A failed pre-release doesn't end the train. The goal is a
+   green pre-release before Tuesday, so fix forward:
+
+   - A transient infrastructure failure can be rerun after approval.
+   - A code defect, or a new advisory against a locked dependency, needs a
+     merged fix and a new pre-release. Don't rerun or promote the failed one.
+   - Let the failed run finish rather than cancelling it. Its other suites
+     still show whether the rest of the commit is healthy.
+   - Once the fix merges and its `Release Dev` run passes, tag the next
+     `-pre.N` on that commit by hand after approval (as in Tuesday step 6, with
+     the next number), instead of waiting for the next Auto-Tag run. That
+     gives a qualifiable candidate a day sooner.
 
 6. **Draft the coordination post.** Release coordination happens in a thread
    in the OpenShell CNCF Slack channel, started on Monday. Draft it for the
@@ -301,7 +311,7 @@ Finish these on Monday so Tuesday is only the cut.
 | Symptom | Action |
 |---|---|
 | Transient infrastructure failure in a pre-release | After approval, run `gh run rerun <run-id> --failed`, then recheck the new attempt's summary. |
-| Code defect in a pre-release | Merge the fix. Let Auto-Tag create the next `-pre.N`, or, after approval, tag and push one by hand. |
+| Code defect in a pre-release | Fix forward (Monday step 5): merge the fix, then, after approval, tag and push the next `-pre.N` on the fix commit once its `Release Dev` run passes. Waiting for Auto-Tag also works but costs up to a day. |
 | `Cargo Deny` fails a pre-release with `error[vulnerability]` | A new RustSec advisory was published against a locked dependency. Code that passed earlier can start failing this way. Rerunning won't help. Find the advisory IDs with `gh run view <run-id> --log-failed \| grep -E 'ID: RUSTSEC'`, look for an open dependency bump PR, and treat the merged bump as a code-defect fix. |
 | A pushed tag started no `Release Tag` run | Wait a few minutes and check `gh run list --workflow release-tag.yml --branch "$TAG"` again. Only after confirming that no run exists, and with approval, dispatch it with `gh workflow run release-tag.yml --ref main -f tag="$TAG"`. |
 | Stable run stuck queued | Don't re-dispatch or delete the tag. Check for a GitHub Actions incident and ask a maintainer to cancel the run (`gh run cancel <run-id>`, or force-cancel through the API). Only after it shows `cancelled` or `failed`, rerun it after approval. |
