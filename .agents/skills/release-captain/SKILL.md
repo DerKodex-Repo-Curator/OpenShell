@@ -38,11 +38,12 @@ tags; the RFC's cleanup step is not implemented and tag deletion is restricted.
 - A train has one base version, such as `v0.1.4`, fixed by its `-pre.1` tag. A
   patch train can't take breaking changes to Stable interfaces. Those wait for a
   minor train.
-- `Release Auto-Tag` runs Monday through Friday at 14:00 Europe/Zurich. If
+- `Release Auto-Tag` runs Monday through Friday at 14:00 Europe/Zurich. That's
+  12:00 UTC during Central European Summer Time and 13:00 UTC in winter. If
   `main` has commits since the latest `-pre.N`, it tags the next one and
   dispatches `Release Tag` (about 45 minutes). It skips after the base version
   gets a stable tag, and fails if the latest pre-release isn't an ancestor of
-  `main`.
+  `main`. A skip still counts as a successful run.
 - Pushing any release tag by hand, pre-release or stable, starts `Release Tag`.
   Don't also dispatch it, or two runs race to publish. Auto-Tag dispatches
   explicitly only because its `GITHUB_TOKEN` push can't trigger workflows.
@@ -50,11 +51,18 @@ tags; the RFC's cleanup step is not implemented and tag deletion is restricted.
   requalifies the commit. Codex Security runs only for pre-releases, so the
   stable release relies on the selected pre-release's security result. Always
   tag the commit of a pre-release that passed.
+- Only stable tags create a GitHub Release, so pre-releases never appear on the
+  Releases page. A passing pre-release publishes its images, Helm chart, and
+  qualification summary to GHCR. Its Debian, RPM, and macOS packages stay as
+  artifacts on the `Release Tag` run. To check a pre-release, look at the tag
+  and that run. A failed pre-release notifies the OpenShell triage Slack
+  channel.
 
 ## Setup
 
 Run from an OpenShell checkout with an authenticated `gh` CLI. Fetch tags with
-`--force` so cached tags match the remote:
+`--force`, because release tags have been removed and recreated, and a plain
+fetch keeps stale local copies:
 
 ```shell
 export GH_REPO=NVIDIA/OpenShell
@@ -62,6 +70,14 @@ git fetch origin main --tags --force
 PREV=$(git tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
 echo "Latest stable: $PREV"
 git tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-pre\.[0-9]+$' | head -5
+```
+
+Release workflows change often, and a local branch may be days behind. Before
+relying on trigger or job behavior, including anything in this skill, read the
+current workflow from `origin/main`:
+
+```shell
+git show origin/main:.github/workflows/release-tag.yml | sed -n '/^on:/,/^permissions:/p'
 ```
 
 Release tags are lightweight, matching the tags Auto-Tag creates. The tag
@@ -87,11 +103,13 @@ contains `($TAG)` is the match. That job appears only after the images build.
 Finish these on Monday so Tuesday is only the cut.
 
 1. **Check the train.** Confirm that the latest `-pre.N` targets the version you
-   plan to ship. Check that the most recent `Release Auto-Tag` run succeeded
-   (today's runs at 14:00 Europe/Zurich):
+   plan to ship. Check that today's `Release Auto-Tag` run (14:00
+   Europe/Zurich) succeeded, and check from its log whether it tagged or
+   skipped:
 
    ```shell
    gh run list --workflow release-auto-tag.yml --limit 3
+   gh run view "$(gh run list --workflow release-auto-tag.yml --limit 1 --json databaseId --jq '.[0].databaseId')" --log | grep -E 'Next tag:|— skipping' | grep -v echo
    ```
 
    If the next version has no `-pre.1`, start the train (Tuesday step 6).
@@ -131,6 +149,12 @@ Finish these on Monday so Tuesday is only the cut.
    - **Unclear:** ask an owner of that code.
    - **False positive:** send it to the owner of
      `.github/prompts/compatibility-review.md` so the prompt can be tuned.
+
+   The reviewer treats every `pub` Rust item as a Stable interface. No
+   workspace crate is published to crates.io, so a finding in an internal
+   crate such as `openshell-core` or `openshell-isolation-interface` is often a
+   false positive. Check whether a supported SDK surface, such as
+   `openshell-sdk`, exposes the item before deciding.
 
 4. **Check the dev canary.** `Release Canary` smoke-tests `main` dev artifacts.
    It doesn't gate the tag, but treat a red canary as a release risk. Use the
@@ -261,9 +285,13 @@ Finish these on Monday so Tuesday is only the cut.
    gh run list --workflow release-tag.yml --branch "$NEXT"
    ```
 
-   Stop if either check prints a message. When the run finishes, read its
-   qualification summary (Monday step 2). From the next weekday, Auto-Tag
-   creates `-pre.2` onward when `main` has new commits.
+   Stop if either check prints a message. The rolling `dev` tag may point at
+   the same commit; it isn't a release tag and doesn't affect versioning.
+
+   The run should appear as `queued` within a minute. Watch it as in Tuesday
+   step 4, then read its qualification summary (Monday step 2). It won't appear
+   on the Releases page. From the next weekday, Auto-Tag creates `-pre.2` onward
+   when `main` has new commits.
 
 7. **Close the loop.** Draft a reply to the coordination thread with the release
    link and any PRs deferred to the next train.
