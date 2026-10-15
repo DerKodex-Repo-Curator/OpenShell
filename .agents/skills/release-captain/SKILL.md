@@ -47,10 +47,10 @@ tags; the RFC's cleanup step is not implemented and tag deletion is restricted.
 - Pushing any release tag by hand, pre-release or stable, starts `Release Tag`.
   Don't also dispatch it, or two runs race to publish. Auto-Tag dispatches
   explicitly only because its `GITHUB_TOKEN` push can't trigger workflows.
-- A stable `vX.Y.Z` tag push rebuilds and
-  requalifies the commit. Codex Security runs only for pre-releases, so the
-  stable release relies on the selected pre-release's security result. Always
-  tag the commit of a pre-release that passed.
+- A stable `vX.Y.Z` tag push rebuilds and requalifies the commit. Always tag
+  the commit of a pre-release that passed.
+- Codex Security is temporarily excluded from release qualification (#4469).
+  `CI.md` explains how to run it by hand against a `-pre.N` candidate.
 - Only stable tags create a GitHub Release, so pre-releases never appear on the
   Releases page. A passing pre-release publishes its images, Helm chart, and
   qualification summary to GHCR. Its Debian, RPM, and macOS packages stay as
@@ -97,8 +97,13 @@ gh run list --workflow release-tag.yml --branch "$TAG"
 gh run list --workflow release-tag.yml --event workflow_dispatch --commit "$(git rev-parse "$TAG^{commit}")"
 ```
 
-If a commit has several dispatched runs, the one whose Codex Security job name
-contains `($TAG)` is the match. That job appears only after the images build.
+If a commit has several dispatched runs, the one with a
+`qualification-$TAG-run-*` artifact is the match. That artifact appears only
+after qualification finishes:
+
+```shell
+gh api "repos/NVIDIA/OpenShell/actions/runs/<run-id>/artifacts?per_page=100" --jq '.artifacts[].name' | grep "qualification-$TAG-"
+```
 
 ## Monday: pre-flight
 
