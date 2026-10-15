@@ -55,8 +55,10 @@ tags; the RFC's cleanup step is not implemented and tag deletion is restricted.
   Releases page. A passing pre-release publishes its images, Helm chart, and
   qualification summary to GHCR. Its Debian, RPM, and macOS packages stay as
   artifacts on the `Release Tag` run. To check a pre-release, look at the tag
-  and that run. A failed pre-release notifies the OpenShell triage Slack
-  channel.
+  and that run.
+- OpenShell TriageBot posts a top-level message in `#openshell-triage`
+  (`C0C20SDLDNW`) for every failed `Release Tag` attempt, with a link to the
+  run. Each rerun that fails gets its own message.
 
 ## Setup
 
@@ -167,7 +169,14 @@ Finish these on Monday so Tuesday is only the cut.
 5. **Plan fixes.** A failed pre-release doesn't end the train. The goal is a
    green pre-release before Tuesday, so fix forward:
 
-   - A transient infrastructure failure can be rerun after approval.
+   - Reply in the thread of the failure's `#openshell-triage` message, so
+     others know someone is working on a fix. Post the cause and the fix or
+     rerun, then post again when a pre-release passes. Draft these replies for
+     the captain to post.
+   - A transient infrastructure failure can be rerun after approval. Runner
+     setup errors, registry push errors, and integration tests that fail only
+     some of the time are common. If a failure looks unrelated to the commit's
+     changes, rerun once before treating it as a code defect.
    - A code defect, or a new advisory against a locked dependency, needs a
      merged fix and a new pre-release. Don't rerun or promote the failed one.
    - Let the failed run finish rather than cancelling it. Its other suites
@@ -310,7 +319,7 @@ Finish these on Monday so Tuesday is only the cut.
 
 | Symptom | Action |
 |---|---|
-| Transient infrastructure failure in a pre-release | After approval, run `gh run rerun <run-id> --failed`, then recheck the new attempt's summary. |
+| Transient infrastructure failure in a pre-release | After approval, run `gh run rerun <run-id> --failed`, then recheck the new attempt's summary. Reply in the failure's `#openshell-triage` thread with the result. |
 | Code defect in a pre-release | Fix forward (Monday step 5): merge the fix, then, after approval, tag and push the next `-pre.N` on the fix commit once its `Release Dev` run passes. Waiting for Auto-Tag also works but costs up to a day. |
 | `Cargo Deny` fails a pre-release with `error[vulnerability]` | A new RustSec advisory was published against a locked dependency. Code that passed earlier can start failing this way. Rerunning won't help. Find the advisory IDs with `gh run view <run-id> --log-failed \| grep -E 'ID: RUSTSEC'`, look for an open dependency bump PR, and treat the merged bump as a code-defect fix. |
 | A pushed tag started no `Release Tag` run | Wait a few minutes and check `gh run list --workflow release-tag.yml --branch "$TAG"` again. Only after confirming that no run exists, and with approval, dispatch it with `gh workflow run release-tag.yml --ref main -f tag="$TAG"`. |
