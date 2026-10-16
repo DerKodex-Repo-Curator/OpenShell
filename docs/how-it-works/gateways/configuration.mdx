@@ -989,7 +989,7 @@ gateway_namespace = "openshell"
 gateway_pod_selector = { "app.kubernetes.io/name" = "openshell", "app.kubernetes.io/instance" = "openshell" }
 
 [openshell.drivers.kubernetes.sandbox_runtime]
-# Port of the TLS-protected Sandbox Protocol listener on the paired Pod.
+# TLS-protected boundary listener reached only by the paired control pod.
 boundary_port = 5500
 ```
 
@@ -997,37 +997,6 @@ The Kubernetes driver always creates the workload `NetworkPolicy` before
 releasing a sandbox Pod. Your cluster CNI must enforce ingress and egress
 `NetworkPolicy` in every sandbox namespace; the Kubernetes API does not verify
 enforcement.
-
-#### Sandbox Control Connection
-
-New Kubernetes sandboxes use `runtime-initiated` control automatically. Existing
-running sandboxes keep their current connection. Stop/start upgrades a legacy
-sandbox to `runtime-initiated`; gateway recovery that replaces both Pods does
-the same. There is no configuration flag. The sandbox runtime dials its
-supervisor Pod through the sandbox's boundary Service, and the driver adds one per-sandbox
-`NetworkPolicy` that allows only that connection, as egress from the workload
-Pod and ingress to the supervisor Pod. Authentication is the same in both modes.
-
-That policy makes the supervisor Pod ingress-isolated even when Helm
-`networkPolicy.enabled` is `false`. The sandbox needs no other ingress to its
-supervisor: exec, file transfer, and logs use connections the supervisor opens.
-Your CNI must still allow kubelet readiness probes to ingress-isolated Pods, as
-it already must for the default `networkPolicy.enabled` SSH policy. Do not
-loosen `os-control-<id>`; add any extra supervisor ingress your platform needs,
-such as monitoring, as a separate policy.
-
-Deploy compatible gateway, `supervisor_image`, and `sandbox_runtime_image`
-versions together. Newly created or restarted sandboxes require all three to
-support runtime-initiated control; pinned older images cannot start them.
-
-Rolling back is not supported for `runtime-initiated` sandboxes. Older gateways,
-supervisors, and sandbox runtimes cannot start or restart them: an older driver
-does not read the recorded mode, the sandbox's Service selects the supervisor
-rather than the workload, and older supervisors and runtimes reject the new
-launch descriptors. Running supervisor and sandbox processes can keep their
-established connection, but starting a new generation with incompatible
-binaries fails closed. Delete those sandboxes before rolling back, or roll
-forward.
 
 In managed workspace mode, the Kubernetes driver copies each explicitly named
 `image_pull_secrets` Secret from `namespace` into the managed workspace

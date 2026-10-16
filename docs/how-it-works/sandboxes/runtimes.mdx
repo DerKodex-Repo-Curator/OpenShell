@@ -299,8 +299,6 @@ Only the OpenShell gateway and the Agent Sandbox controller should be able to ma
 | `proxy_auth_secret_name` / `proxy_auth_secret_key` | `upstreamProxy.authSecret.name` / `.key` | Secret holding the proxy `user:pass` credential. |
 | `proxy_ca_bundle` | `upstreamProxy.caBundle.configMapName` / `.key` | ConfigMap with the proxy's CA certificate. |
 
-New and restarted Kubernetes sandboxes use a runtime-initiated control connection automatically. Existing running generations keep their current connection until replaced. Deploy compatible gateway, supervisor, and sandbox runtime images together. See [Sandbox Control Connection](/how-it-works/gateways/configuration#sandbox-control-connection).
-
 For the full list, see the [Gateway Configuration File](/how-it-works/gateways/configuration) reference.
 
 On OpenShift, copy the cluster proxy's CA into the gateway namespace and set `upstreamProxy.caBundle.configMapName` to `corporate-proxy-ca`:
