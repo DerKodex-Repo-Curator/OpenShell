@@ -231,47 +231,23 @@ impl BackendSetup for OpenShellBackendSetup {
                     gid: descriptor.workload_identity.gid,
                 }),
         };
+        let transport = openshell_sandbox_backend::BoundaryTransport::for_descriptor(&descriptor)?;
         Ok((
             identity,
             Box::new(OpenShellLaunch {
                 descriptor,
-                runtime_initiated: std::sync::OnceLock::new(),
+                transport,
             }),
         ))
     }
 }
 
+/// Launch data plus the transport chosen for it. Discovery and the attached
+/// backend use clones of one transport, so a runtime-initiated descriptor binds
+/// its control listener once for the supervisor's lifetime.
 struct OpenShellLaunch {
     descriptor: openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor,
-    /// Bound once and shared by discovery and the attached backend, so a
-    /// runtime spare accepted during discovery remains usable for attach.
-    runtime_initiated:
-        std::sync::OnceLock<Arc<openshell_sandbox_backend::RuntimeInitiatedListener>>,
-}
-
-impl OpenShellLaunch {
-    /// The listener exists only for a runtime-initiated transport. Binding
-    /// requires the supervisor's Tokio runtime and happens before attach.
-    fn runtime_initiated_listener(
-        &self,
-    ) -> std::result::Result<
-        Option<Arc<openshell_sandbox_backend::RuntimeInitiatedListener>>,
-        BackendError,
-    > {
-        if !matches!(
-            self.descriptor.transport,
-            openshell_sandbox_backend::boundary_protocol::SandboxTransport::RuntimeInitiatedTcp { .. }
-        ) {
-            return Ok(None);
-        }
-        if let Some(listener) = self.runtime_initiated.get() {
-            return Ok(Some(listener.clone()));
-        }
-        let listener = openshell_sandbox_backend::RuntimeInitiatedListener::bind(&self.descriptor)?;
-        Ok(Some(
-            self.runtime_initiated.get_or_init(|| listener).clone(),
-        ))
-    }
+    transport: openshell_sandbox_backend::BoundaryTransport,
 }
 
 #[tonic::async_trait]
@@ -280,23 +256,12 @@ impl PreparedBackend for OpenShellLaunch {
         &self,
         bearer: SessionBearerTokenSlot,
     ) -> std::result::Result<(Option<String>, bool), BackendError> {
-        match self.runtime_initiated_listener()? {
-            Some(listener) => {
-                openshell_sandbox_backend::OpenShellRuntimeBackend::discover_policy_with_runtime_initiated_listener(
-                    self.descriptor.clone(),
-                    bearer,
-                    listener,
-                )
-                .await
-            }
-            None => {
-                openshell_sandbox_backend::OpenShellRuntimeBackend::discover_policy(
-                    self.descriptor.clone(),
-                    bearer,
-                )
-                .await
-            }
-        }
+        openshell_sandbox_backend::OpenShellRuntimeBackend::discover_policy(
+            self.descriptor.clone(),
+            bearer,
+            self.transport.clone(),
+        )
+        .await
     }
 
     fn build(
@@ -304,18 +269,17 @@ impl PreparedBackend for OpenShellLaunch {
         services: BackendServices,
     ) -> std::result::Result<BuiltBackend, BackendError> {
         let payload = self.descriptor.backend_descriptor()?.payload;
-        let mut backend = openshell_sandbox_backend::OpenShellRuntimeBackend::new(
-            services.ca_file_paths,
-            services.provider_credentials,
-            services.sandbox_bearer,
-        );
-        if let Some(listener) = self.runtime_initiated_listener()? {
-            backend = backend.with_runtime_initiated_listener(listener);
-        }
         Ok(BuiltBackend {
             payload,
             proxy_listener: None,
-            backend: Arc::new(backend),
+            backend: Arc::new(
+                openshell_sandbox_backend::OpenShellRuntimeBackend::new(
+                    services.ca_file_paths,
+                    services.provider_credentials,
+                    services.sandbox_bearer,
+                )
+                .with_transport(self.transport),
+            ),
         })
     }
 }

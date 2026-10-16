@@ -41,31 +41,24 @@ struct KubernetesOuterFenceEvidence<'a> {
     /// Present only for runtime-initiated control. Omitted otherwise so the
     /// supervisor-initiated evidence encoding and digest are unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
-    runtime_control_egress: Option<KubernetesControlEgressEvidence<'a>>,
+    runtime_control_policy: Option<KubernetesControlPolicyEvidence<'a>>,
 }
 
-/// Facts about the per-sandbox policy that admits only the runtime's dial to
-/// its own supervisor. The driver records them only after verifying the
-/// stored policy matches [`runtime_control_policy`].
+/// The stored per-pair control policy bound into this generation. The driver
+/// supplies it only after verifying the stored object equals
+/// [`runtime_control_policy`] for this pair and port, so its only added path
+/// is the runtime's connection to its own supervisor.
 #[derive(Serialize)]
-struct KubernetesControlEgressEvidence<'a> {
+struct KubernetesControlPolicyEvidence<'a> {
     network_policy_uid: &'a str,
     network_policy_resource_version: &'a str,
-    /// Egress rules in the policy; the only one targets the paired supervisor.
-    egress_rule_count: u32,
-    /// Ingress rules in the policy; the only one admits the paired workload.
-    ingress_rule_count: u32,
-    paired_supervisor_only: bool,
     port: u16,
 }
 
-impl KubernetesControlEgressEvidence<'_> {
-    fn is_managed_control_path(&self) -> bool {
+impl KubernetesControlPolicyEvidence<'_> {
+    fn is_bound(&self) -> bool {
         !self.network_policy_uid.is_empty()
             && !self.network_policy_resource_version.is_empty()
-            && self.egress_rule_count == 1
-            && self.ingress_rule_count == 1
-            && self.paired_supervisor_only
             && self.port != 0
     }
 }
@@ -82,7 +75,7 @@ impl KubernetesOuterFenceEvidence<'_> {
                 "Kubernetes provisioning evidence is incomplete".to_string(),
             ));
         }
-        if self.runtime_control_egress.as_ref().is_some_and(|control| !control.is_managed_control_path()) {
+        if self.runtime_control_policy.as_ref().is_some_and(|control| !control.is_bound()) {
             return Err(BackendError::Descriptor("Kubernetes control policy evidence is incomplete".into()));
         }
         let encoded = serde_json::to_vec(self).map_err(|error| {
@@ -422,13 +415,10 @@ impl KubernetesSandboxRuntimeBoundarySpec {
             ingress_isolated: true,
             egress_isolated: true,
             egress_rule_count: 0,
-            runtime_control_egress: control_port.map(|port| KubernetesControlEgressEvidence {
+            runtime_control_policy: control_port.map(|port| KubernetesControlPolicyEvidence {
                 network_policy_uid: &resource_claims["kubernetes.control_policy_uid"],
                 network_policy_resource_version: &resource_claims
                     ["kubernetes.control_policy_resource_version"],
-                egress_rule_count: 1,
-                ingress_rule_count: 1,
-                paired_supervisor_only: true,
                 port,
             }),
         }
@@ -480,7 +470,7 @@ mod tests {
                 ingress_isolated: true,
                 egress_isolated: true,
                 egress_rule_count: 0,
-                runtime_control_egress: None,
+                runtime_control_policy: None,
             },
             KubernetesOuterFenceEvidence {
                 network_policy_uid: "uid",
@@ -488,7 +478,7 @@ mod tests {
                 ingress_isolated: true,
                 egress_isolated: true,
                 egress_rule_count: 0,
-                runtime_control_egress: None,
+                runtime_control_policy: None,
             },
             KubernetesOuterFenceEvidence {
                 network_policy_uid: "uid",
@@ -496,7 +486,7 @@ mod tests {
                 ingress_isolated: false,
                 egress_isolated: true,
                 egress_rule_count: 0,
-                runtime_control_egress: None,
+                runtime_control_policy: None,
             },
             KubernetesOuterFenceEvidence {
                 network_policy_uid: "uid",
@@ -504,7 +494,7 @@ mod tests {
                 ingress_isolated: true,
                 egress_isolated: false,
                 egress_rule_count: 0,
-                runtime_control_egress: None,
+                runtime_control_policy: None,
             },
             KubernetesOuterFenceEvidence {
                 network_policy_uid: "uid",
@@ -512,7 +502,7 @@ mod tests {
                 ingress_isolated: true,
                 egress_isolated: true,
                 egress_rule_count: 1,
-                runtime_control_egress: None,
+                runtime_control_policy: None,
             },
         ] {
             assert!(evidence.project("generation-1").is_err());
@@ -643,7 +633,7 @@ mod tests {
             ingress_isolated: true,
             egress_isolated: true,
             egress_rule_count: 0,
-            runtime_control_egress: None,
+            runtime_control_policy: None,
         };
         assert_eq!(
             serde_json::to_string(&evidence).unwrap(),
@@ -703,27 +693,19 @@ mod tests {
     }
 
     #[test]
-    fn runtime_control_evidence_rejects_any_unmanaged_egress() {
-        let control = |uid, rules, paired| KubernetesControlEgressEvidence {
-            network_policy_uid: uid,
-            network_policy_resource_version: "1",
-            egress_rule_count: rules,
-            ingress_rule_count: 1,
-            paired_supervisor_only: paired,
-            port: 5500,
-        };
-        for runtime_control_egress in [
-            control("", 1, true),
-            control("uid", 2, true),
-            control("uid", 1, false),
-        ] {
+    fn runtime_control_evidence_requires_bound_policy_coordinates() {
+        for (uid, resource_version, port) in [("", "1", 5500), ("uid", "", 5500), ("uid", "1", 0)] {
             let evidence = KubernetesOuterFenceEvidence {
                 network_policy_uid: "uid",
                 network_policy_resource_version: "1",
                 ingress_isolated: true,
                 egress_isolated: true,
                 egress_rule_count: 0,
-                runtime_control_egress: Some(runtime_control_egress),
+                runtime_control_policy: Some(KubernetesControlPolicyEvidence {
+                    network_policy_uid: uid,
+                    network_policy_resource_version: resource_version,
+                    port,
+                }),
             };
             assert!(evidence.project("generation-1").is_err());
         }

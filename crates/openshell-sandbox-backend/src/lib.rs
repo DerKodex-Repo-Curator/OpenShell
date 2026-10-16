@@ -27,8 +27,7 @@ pub use runtime::{
     ConfirmedBoundary, ExecSession, NetworkMediationSource, OpenShellRuntimeBackend,
     ProcessAttachment, ReadyBoundary, RunningBoundary,
 };
-pub use runtime::BoundaryTransportConnector;
-pub use runtime_initiated::RuntimeInitiatedListener;
+pub use runtime::{BoundaryTransport, BoundaryTransportConnector};
 
 /// Stable isolation backend name implemented by `openshell-sandbox`.
 pub const BACKEND_NAME: &str = openshell_core::isolation_registration::BUILTIN_BACKEND_NAME;

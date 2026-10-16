@@ -650,8 +650,10 @@ mod linux {
     ///
     /// The supervisor claims a spare by starting HTTP/2 on it; then the next
     /// spare is dialed so credential rotation and recovery, which open a new
-    /// connection before retiring the old one, never wait on this loop. Live
-    /// connections keep the existing disconnect, freeze, and termination path.
+    /// connection before retiring the old one, never wait on this loop. TLS
+    /// failures back off like dial failures. Established spares are served
+    /// like accepted connections: same identity, slot limit, and disconnect,
+    /// freeze, and termination handling.
     async fn run_runtime_initiated_control(
         addresses: Vec<std::net::SocketAddr>,
         server_config: Arc<rustls::ServerConfig>,
@@ -659,59 +661,51 @@ mod linux {
         active_connections: Arc<AtomicUsize>,
     ) {
         let mut backoff = RUNTIME_DIAL_BACKOFF_MIN;
-        let mut first_failure: Option<tokio::time::Instant> = None;
-        let mut last_warning: Option<tokio::time::Instant> = None;
+        let mut warn_at: Option<tokio::time::Instant> = None;
         loop {
-            let Some(slot) = acquire_control_connection_slot(&active_connections) else {
-                tokio::time::sleep(RUNTIME_DIAL_BACKOFF_MAX).await;
-                continue;
+            let established = match dial_supervisor(&addresses).await {
+                Ok(stream) => ControlStream::PendingTls {
+                    stream: PlainControlStream::Tcp(stream),
+                    server_config: server_config.clone(),
+                }
+                .establish_async(&runtime.process_runtime)
+                .await
+                .map_err(|error| format!("authenticate boundary transport: {error}")),
+                Err(error) => Err(format!("dial supervisor: {error}")),
             };
-            let dialed_at = tokio::time::Instant::now();
-            let stream = match dial_runtime_initiated(&addresses, server_config.clone()).await {
+            let healthy = match established {
                 Ok(stream) => {
-                    first_failure = None;
-                    stream
+                    warn_at = None;
+                    let established_at = tokio::time::Instant::now();
+                    let (claimed, claim) = tokio::sync::oneshot::channel();
+                    let served = serve_authenticated_connection(
+                        stream,
+                        runtime.clone(),
+                        active_connections.clone(),
+                        Some(claimed),
+                    );
+                    runtime.process_runtime.spawn(async move {
+                        if let Err(error) = served.await {
+                            tracing::debug!(%error, "Boundary control connection ended");
+                        }
+                    });
+                    // A used spare, or one that stayed open, needs no backoff.
+                    claim.await.is_ok() || established_at.elapsed() >= RUNTIME_SPARE_MIN_LIFETIME
                 }
                 Err(error) => {
+                    // Failures are expected while the supervisor starts; report
+                    // a persistent one at most once per interval.
                     let now = tokio::time::Instant::now();
-                    let failing_since = *first_failure.get_or_insert(now);
-                    if now.duration_since(failing_since) >= RUNTIME_DIAL_WARNING_INTERVAL
-                        && last_warning.is_none_or(|last| {
-                            now.duration_since(last) >= RUNTIME_DIAL_WARNING_INTERVAL
-                        })
-                    {
-                        last_warning = Some(now);
-                        tracing::warn!(
-                            %error,
-                            failing_for_secs = now.duration_since(failing_since).as_secs(),
-                            "Runtime-initiated control cannot reach the supervisor; retrying"
-                        );
+                    if now >= *warn_at.get_or_insert(now + RUNTIME_DIAL_WARNING_INTERVAL) {
+                        warn_at = Some(now + RUNTIME_DIAL_WARNING_INTERVAL);
+                        tracing::warn!(%error, "Runtime-initiated control cannot reach the supervisor; retrying");
                     } else {
                         tracing::debug!(%error, "Runtime-initiated control dial failed; retrying");
                     }
-                    drop(slot);
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(RUNTIME_DIAL_BACKOFF_MAX);
-                    continue;
+                    false
                 }
             };
-            let (claimed, claim) = tokio::sync::oneshot::channel();
-            runtime.process_runtime.spawn({
-                let runtime = runtime.clone();
-                async move {
-                    let _slot = slot;
-                    let stream = Box::new(ClaimOnFirstRead {
-                        inner: stream,
-                        claimed: Some(claimed),
-                    });
-                    if let Err(error) =
-                        serve_grpc(stream, runtime, SandboxConnectionId::new()).await
-                    {
-                        tracing::debug!(%error, "Boundary control connection ended");
-                    }
-                }
-            });
-            if claim.await.is_ok() || dialed_at.elapsed() >= RUNTIME_SPARE_MIN_LIFETIME {
+            if healthy {
                 backoff = RUNTIME_DIAL_BACKOFF_MIN;
             } else {
                 tokio::time::sleep(backoff).await;
@@ -720,10 +714,10 @@ mod linux {
         }
     }
 
-    async fn dial_runtime_initiated(
+    /// Dial only driver-provided supervisor addresses from the bootstrap.
+    async fn dial_supervisor(
         addresses: &[std::net::SocketAddr],
-        server_config: Arc<rustls::ServerConfig>,
-    ) -> io::Result<openshell_isolation_interface::contract::BoundaryDuplexStream> {
+    ) -> io::Result<std::net::TcpStream> {
         let stream = tokio::time::timeout(
             RUNTIME_DIAL_TIMEOUT,
             openshell_core::net::connect_tcp_nodelay_best_effort(addresses),
@@ -737,14 +731,7 @@ mod linux {
             .with_interval(Duration::from_secs(5))
             .with_retries(3);
         let _ = socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive);
-        let stream = tokio::time::timeout(
-            CONTROL_HANDSHAKE_TIMEOUT,
-            tokio_rustls::TlsAcceptor::from(server_config).accept(stream),
-        )
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "boundary TLS handshake timed out"))?
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        Ok(Box::new(stream))
+        stream.into_std()
     }
 
     /// Signals once the supervisor sends its first application bytes.
@@ -811,10 +798,30 @@ mod linux {
             .await
             .map_err(|error| format!("authenticate boundary transport: {error}"))?;
         drop(pending);
+        serve_authenticated_connection(stream, runtime, active_connections, None).await
+    }
+
+    /// Serve one TLS-established connection, accepted or runtime-initiated.
+    /// `claimed`, used by runtime-initiated spares, fires when the supervisor
+    /// first sends data.
+    async fn serve_authenticated_connection(
+        stream: ControlStream,
+        runtime: Arc<BoundaryRuntime>,
+        active_connections: Arc<AtomicUsize>,
+        claimed: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<(), String> {
         let Some(_slot) = acquire_control_connection_slot(&active_connections) else {
             return Err("authenticated control connection limit reached".to_string());
         };
-        serve_grpc(stream.into_tokio()?, runtime, SandboxConnectionId::new()).await
+        let stream = stream.into_tokio()?;
+        let stream = match claimed {
+            Some(claimed) => Box::new(ClaimOnFirstRead {
+                inner: stream,
+                claimed: Some(claimed),
+            }),
+            None => stream,
+        };
+        serve_grpc(stream, runtime, SandboxConnectionId::new()).await
     }
 
     async fn serve_grpc(

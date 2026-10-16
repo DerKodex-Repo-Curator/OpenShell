@@ -102,25 +102,20 @@ retain generation, session, resource, identity, and provisioning evidence checks
 
 ## Boundary transport establishment
 
-Backends may supply a `BoundaryTransportConnector` for raw stream establishment.
-The shared client retains TLS peer verification, session bearer authentication,
-generation checks, and reconnection handling. The connector is reused for policy
-discovery and attachment; it does not define platform launch configuration or
-replace the isolation interface.
+The supervisor chooses one `BoundaryTransport` per runtime descriptor and uses
+clones of it for policy discovery and attachment. It dials the descriptor's
+endpoint, uses a backend-supplied `BoundaryTransportConnector` for raw stream
+establishment, or, for `SandboxTransport::RuntimeInitiatedTcp`, accepts the
+connections the sandbox runtime opens. Every stream from every source completes
+the same pinned TLS client handshake before it carries a request; the shared
+client also keeps session bearer authentication, generation checks, and
+reconnection handling.
 
-### Runtime-initiated transport
-
-`SandboxTransport::RuntimeInitiatedTcp` and
-`BoundaryListener::RuntimeInitiatedTlsTcp` reverse only the TCP dial: the
-sandbox runtime connects to the supervisor, then remains the TLS server and gRPC
-server. The supervisor binds one `RuntimeInitiatedListener` per sandbox session
-and shares it between policy discovery and attachment. The listener completes
-TLS with the descriptor's pinned identity before it queues a stream, bounds
-concurrent unauthenticated handshakes and their duration, and keeps at most two
-unclaimed authenticated streams. The client wraps each stream in the same
-abortable transport as dialed connections, so cancellation closes the socket.
-The runtime keeps one unclaimed spare connection open so reconnects and
-credential rotation never wait for a new dial.
+For runtime-initiated connections, the supervisor authenticates each accepted
+socket before queueing it. Concurrent unauthenticated handshakes are bounded in
+number and duration, and at most two authenticated spares wait for a client, so
+a new connection cannot displace a live channel. The runtime keeps one spare
+open, so reconnects and credential rotation never wait for a new dial.
 
 The new variants leave existing encodings unchanged. Binaries that predate them
 reject runtime-initiated descriptors instead of falling back to another mode.

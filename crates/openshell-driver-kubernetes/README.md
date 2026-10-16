@@ -123,27 +123,20 @@ the sandbox's lifetime; it selects the paired workload Pod for
 For `runtime-initiated`:
 
 - The bootstrap Secret gives the runtime the Service ClusterIP and port. The
-  runtime dials it, keeps one unclaimed spare connection for reconnects and
-  credential rotation, and retries with capped backoff until the supervisor
-  listens, so neither Pod waits on the other during bootstrap. The workload
-  still cannot reach the control port.
-- The supervisor listens on `boundary_port`. It completes TLS on each accepted
-  socket before use, limits concurrent unauthenticated handshakes and their
-  duration, and queues at most two authenticated spares. A new connection
-  cannot displace a live authenticated channel.
-- The driver adds a per-sandbox `NetworkPolicy` `os-control-<id>` that selects
-  only this sandbox's two Pods and admits one flow, from its workload Pod to its
-  supervisor Pod on `boundary_port` over TCP, as both workload egress and
-  supervisor ingress. Ingress matters because supervisors can already be
-  ingress-isolated, for example by the managed SSH ingress policy, which selects
-  every OpenShell-managed Pod. This also makes the supervisor ingress-isolated
-  when that SSH policy is disabled; exec, file sync, and logs need no other
-  supervisor ingress because the supervisor opens those connections. The CNI
-  must still allow kubelet readiness probes. The namespace-wide policies are
-  unchanged.
-- The boundary Service sets `publishNotReadyAddresses`, because the supervisor
-  becomes Ready only after the runtime has attached through that Service.
-  The policy's UID and resourceVersion are bound into the boundary resource
+  runtime retries with capped backoff until the supervisor listens, so neither
+  Pod waits on the other during bootstrap. The Service sets
+  `publishNotReadyAddresses` because the supervisor becomes Ready only after
+  the runtime attaches through it. The workload still cannot reach the control
+  port.
+- A per-sandbox `NetworkPolicy` `os-control-<id>` selects only this sandbox's
+  two Pods and admits one flow, from its workload Pod to its supervisor Pod on
+  `boundary_port` over TCP, as workload egress and supervisor ingress.
+  Supervisors may already be ingress-isolated by the managed SSH ingress policy;
+  when that policy is disabled, this one isolates them. Exec, file sync, and
+  logs need no other supervisor ingress because the supervisor opens those
+  connections. The CNI must still allow kubelet readiness probes. The
+  namespace-wide policies are unchanged.
+- The policy's UID and resourceVersion are bound into the boundary resource
   claims and outer-fence evidence. Reconciliation suspends the workload if the
   policy disappears, diverges, or changes generation, or if the boundary
   Service no longer selects the role the recorded mode requires.
