@@ -74,18 +74,63 @@ pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME: &str = "default";
 /// Default storage size for the workspace PVC.
 pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 
+/// Which side opens the Sandbox Protocol TCP connection.
+///
+/// Recorded on each Sandbox resource at creation. Existing sandboxes keep their
+/// recorded mode across stop/start, restarts, and upgrades; a sandbox created
+/// before this setting existed is `SupervisorInitiated`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KubernetesControlConnection {
+    /// The sandbox runtime dials its supervisor's per-sandbox Service.
+    #[default]
+    RuntimeInitiated,
+    /// The supervisor dials the sandbox runtime's listener (original mode).
+    SupervisorInitiated,
+}
+
+impl KubernetesControlConnection {
+    /// Stable spelling used in configuration and Sandbox annotations.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RuntimeInitiated => "runtime-initiated",
+            Self::SupervisorInitiated => "supervisor-initiated",
+        }
+    }
+}
+
+impl FromStr for KubernetesControlConnection {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "runtime-initiated" => Ok(Self::RuntimeInitiated),
+            "supervisor-initiated" => Ok(Self::SupervisorInitiated),
+            other => Err(format!(
+                "invalid sandbox control connection '{other}'; expected runtime-initiated or supervisor-initiated"
+            )),
+        }
+    }
+}
+
 /// Driver-owned requirements for the Kubernetes sandbox runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesSandboxRuntimeConfig {
-    /// TCP port exposed by the workload boundary to its paired control pod.
+    /// TCP port of the Sandbox Protocol listener: the workload boundary for
+    /// supervisor-initiated sandboxes, the supervisor for runtime-initiated ones.
     pub boundary_port: u16,
+    /// Connection mode recorded on sandboxes created from now on. Changing it
+    /// never migrates an existing sandbox.
+    pub control_connection: KubernetesControlConnection,
 }
 
 impl Default for KubernetesSandboxRuntimeConfig {
     fn default() -> Self {
         Self {
             boundary_port: 5500,
+            control_connection: KubernetesControlConnection::default(),
         }
     }
 }
@@ -952,6 +997,25 @@ fn validate_provider_spiffe_workload_api_socket_path_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_connection_creation_default_is_runtime_initiated_and_overridable() {
+        assert_eq!(
+            KubernetesSandboxRuntimeConfig::default().control_connection,
+            KubernetesControlConnection::RuntimeInitiated
+        );
+        let parsed: KubernetesSandboxRuntimeConfig =
+            toml::from_str("control_connection = \"supervisor-initiated\"").unwrap();
+        assert_eq!(
+            parsed.control_connection,
+            KubernetesControlConnection::SupervisorInitiated
+        );
+        assert_eq!(parsed.boundary_port, 5500);
+        assert!(
+            toml::from_str::<KubernetesSandboxRuntimeConfig>("control_connection = \"both\"")
+                .is_err()
+        );
+    }
     use std::collections::BTreeMap as HashMap;
 
     #[test]

@@ -231,11 +231,48 @@ impl BackendSetup for OpenShellBackendSetup {
                     gid: descriptor.workload_identity.gid,
                 }),
         };
-        Ok((identity, Box::new(OpenShellLaunch(descriptor))))
+        Ok((
+            identity,
+            Box::new(OpenShellLaunch {
+                descriptor,
+                runtime_initiated: std::sync::OnceLock::new(),
+            }),
+        ))
     }
 }
 
-struct OpenShellLaunch(openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor);
+struct OpenShellLaunch {
+    descriptor: openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor,
+    /// Bound once and shared by discovery and the attached backend, so a
+    /// runtime spare accepted during discovery remains usable for attach.
+    runtime_initiated:
+        std::sync::OnceLock<Arc<openshell_sandbox_backend::RuntimeInitiatedListener>>,
+}
+
+impl OpenShellLaunch {
+    /// The listener exists only for a runtime-initiated transport. Binding
+    /// requires the supervisor's Tokio runtime and happens before attach.
+    fn runtime_initiated_listener(
+        &self,
+    ) -> std::result::Result<
+        Option<Arc<openshell_sandbox_backend::RuntimeInitiatedListener>>,
+        BackendError,
+    > {
+        if !matches!(
+            self.descriptor.transport,
+            openshell_sandbox_backend::boundary_protocol::SandboxTransport::RuntimeInitiatedTcp { .. }
+        ) {
+            return Ok(None);
+        }
+        if let Some(listener) = self.runtime_initiated.get() {
+            return Ok(Some(listener.clone()));
+        }
+        let listener = openshell_sandbox_backend::RuntimeInitiatedListener::bind(&self.descriptor)?;
+        Ok(Some(
+            self.runtime_initiated.get_or_init(|| listener).clone(),
+        ))
+    }
+}
 
 #[tonic::async_trait]
 impl PreparedBackend for OpenShellLaunch {
@@ -243,23 +280,42 @@ impl PreparedBackend for OpenShellLaunch {
         &self,
         bearer: SessionBearerTokenSlot,
     ) -> std::result::Result<(Option<String>, bool), BackendError> {
-        openshell_sandbox_backend::OpenShellRuntimeBackend::discover_policy(self.0.clone(), bearer)
-            .await
+        match self.runtime_initiated_listener()? {
+            Some(listener) => {
+                openshell_sandbox_backend::OpenShellRuntimeBackend::discover_policy_with_runtime_initiated_listener(
+                    self.descriptor.clone(),
+                    bearer,
+                    listener,
+                )
+                .await
+            }
+            None => {
+                openshell_sandbox_backend::OpenShellRuntimeBackend::discover_policy(
+                    self.descriptor.clone(),
+                    bearer,
+                )
+                .await
+            }
+        }
     }
 
     fn build(
         self: Box<Self>,
         services: BackendServices,
     ) -> std::result::Result<BuiltBackend, BackendError> {
-        let payload = self.0.backend_descriptor()?.payload;
+        let payload = self.descriptor.backend_descriptor()?.payload;
+        let mut backend = openshell_sandbox_backend::OpenShellRuntimeBackend::new(
+            services.ca_file_paths,
+            services.provider_credentials,
+            services.sandbox_bearer,
+        );
+        if let Some(listener) = self.runtime_initiated_listener()? {
+            backend = backend.with_runtime_initiated_listener(listener);
+        }
         Ok(BuiltBackend {
             payload,
             proxy_listener: None,
-            backend: Arc::new(openshell_sandbox_backend::OpenShellRuntimeBackend::new(
-                services.ca_file_paths,
-                services.provider_credentials,
-                services.sandbox_bearer,
-            )),
+            backend: Arc::new(backend),
         })
     }
 }

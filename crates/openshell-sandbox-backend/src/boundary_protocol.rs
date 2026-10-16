@@ -354,6 +354,15 @@ pub enum BoundaryListener {
         control_port: u32,
         tls: SandboxTlsServerConfig,
     },
+    /// The boundary dials the supervisor's listener and serves TLS and gRPC
+    /// over that outbound connection. Only driver-resolved addresses are used.
+    RuntimeInitiatedTlsTcp {
+        /// Stable logical Service authority, for diagnostics.
+        authority: String,
+        /// Driver-resolved supervisor endpoints, tried in order.
+        addresses: Vec<std::net::SocketAddr>,
+        tls: SandboxTlsServerConfig,
+    },
 }
 
 /// Public verification key staged in the sandbox's immutable auth bundle.
@@ -1763,6 +1772,67 @@ mod tests {
         let encoded = serde_json::to_vec(&transport).expect("encode transport");
         let decoded: SandboxTransport = serde_json::from_slice(&encoded).expect("decode transport");
         assert_eq!(decoded, transport);
+    }
+
+    #[test]
+    fn legacy_control_encodings_are_unchanged_by_runtime_initiated_variants() {
+        // Binaries from before runtime-initiated control decode exactly these
+        // shapes; the new variants must not alter them.
+        let transport = SandboxTransport::Tcp {
+            authority: "os-boundary-a.ns.svc:5500".to_string(),
+            addresses: vec!["10.43.0.9:5500".parse().expect("test address")],
+        };
+        assert_eq!(
+            serde_json::to_string(&transport).unwrap(),
+            r#"{"kind":"tcp","authority":"os-boundary-a.ns.svc:5500","addresses":["10.43.0.9:5500"]}"#
+        );
+        let listener = BoundaryListener::TlsTcp {
+            address: "0.0.0.0:5500".parse().expect("test address"),
+            tls: SandboxTlsServerConfig {
+                certificate_chain_path: PathBuf::from("/run/tls.crt"),
+                private_key_path: PathBuf::from("/run/tls.key"),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&listener).unwrap(),
+            r#"{"kind":"tls-tcp","address":"0.0.0.0:5500","tls":{"certificate_chain_path":"/run/tls.crt","private_key_path":"/run/tls.key"}}"#
+        );
+    }
+
+    #[test]
+    fn runtime_initiated_control_variants_round_trip_and_reject_unknown_fields() {
+        let transport = SandboxTransport::RuntimeInitiatedTcp {
+            authority: "os-boundary-a.ns.svc:5500".to_string(),
+            listen_address: "0.0.0.0:5500".parse().expect("test address"),
+        };
+        let encoded = serde_json::to_string(&transport).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"kind":"runtime-initiated-tcp","authority":"os-boundary-a.ns.svc:5500","listen_address":"0.0.0.0:5500"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SandboxTransport>(&encoded).unwrap(),
+            transport
+        );
+        let listener = BoundaryListener::RuntimeInitiatedTlsTcp {
+            authority: "os-boundary-a.ns.svc:5500".to_string(),
+            addresses: vec!["10.43.0.9:5500".parse().expect("test address")],
+            tls: SandboxTlsServerConfig {
+                certificate_chain_path: PathBuf::from("/run/tls.crt"),
+                private_key_path: PathBuf::from("/run/tls.key"),
+            },
+        };
+        let encoded = serde_json::to_string(&listener).unwrap();
+        assert_eq!(
+            serde_json::from_str::<BoundaryListener>(&encoded).unwrap(),
+            listener
+        );
+        assert!(
+            serde_json::from_str::<SandboxTransport>(
+                r#"{"kind":"runtime-initiated-tcp","authority":"a","listen_address":"0.0.0.0:5500","target":"10.0.0.1:1"}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

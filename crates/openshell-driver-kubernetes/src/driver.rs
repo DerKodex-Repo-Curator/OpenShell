@@ -5,17 +5,20 @@
 
 use crate::config::{
     DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID, DEFAULT_WORKSPACE_STORAGE_SIZE,
-    KubernetesComputeConfig, OperatorNamespaceAllowlist, WorkspaceMode, is_dns_1123_label,
-    managed_namespace, managed_namespace_prefix, validate_managed_namespace_name,
+    KubernetesComputeConfig, KubernetesControlConnection, OperatorNamespaceAllowlist,
+    WorkspaceMode, is_dns_1123_label, managed_namespace, managed_namespace_prefix,
+    validate_managed_namespace_name,
 };
 use crate::isolation::{
-    BOUNDARY_PAIR_LABEL, BOUNDARY_ROLE_LABEL, KubernetesSandboxRuntimeBoundarySpec,
+    BOUNDARY_PAIR_LABEL, BOUNDARY_ROLE_LABEL, KubernetesControlPath,
+    KubernetesSandboxRuntimeBoundarySpec,
 };
 use crate::lifecycle::LifecycleGates;
 use crate::sandbox_runtime::{
     BOUNDARY_CERTIFICATE_PATH, BOUNDARY_CONFIG_PATH, BOUNDARY_PRIVATE_KEY_PATH, ClientTlsMaterial,
     SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS, SandboxRuntimeNames, SupervisorClientTls,
-    boundary_service, generate_proxy_ca_material, image_pull_secret_copy, sandbox_bootstrap_secret,
+    boundary_service, boundary_service_matches_mode, control_policy, generate_proxy_ca_material,
+    image_pull_secret_copy, sandbox_bootstrap_secret,
     sandbox_owner_reference as sandbox_runtime_sandbox_owner_reference,
     supervisor_bootstrap_secret, supervisor_pod, workload_fence,
 };
@@ -104,6 +107,14 @@ const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: &str =
     "openshell.ai/sandbox-runtime-network-policy-uid";
 const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: &str =
     "openshell.ai/sandbox-runtime-network-policy-generation";
+/// Durable, creation-time Sandbox Protocol connection mode. Absent on
+/// sandboxes created before the mode existed, which are supervisor-initiated.
+const ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION: &str =
+    "openshell.ai/sandbox-runtime-control-connection";
+const ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_UID: &str =
+    "openshell.ai/sandbox-runtime-control-policy-uid";
+const ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_GENERATION: &str =
+    "openshell.ai/sandbox-runtime-control-policy-generation";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SandboxRuntimeBootstrapPhase {
@@ -143,6 +154,72 @@ fn boundary_service_authority(
         "{}.{}.svc:{boundary_port}",
         names.boundary_service, namespace
     )
+}
+
+/// Read the connection mode recorded when the sandbox was created. Starting a
+/// sandbox never consults the current creation default.
+fn sandbox_runtime_control_connection(
+    object: &DynamicObject,
+) -> Result<KubernetesControlConnection, KubernetesDriverError> {
+    object
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION))
+        .map_or(
+            Ok(KubernetesControlConnection::SupervisorInitiated),
+            |value| value.parse().map_err(KubernetesDriverError::Precondition),
+        )
+}
+
+/// Stored coordinates of a validated runtime-initiated control policy.
+struct VerifiedControlPolicy {
+    uid: String,
+    resource_version: String,
+    generation: i64,
+}
+
+impl VerifiedControlPolicy {
+    fn from_policy(policy: &NetworkPolicy) -> Result<Self, KubernetesDriverError> {
+        let missing = |field: &str| {
+            KubernetesDriverError::Message(format!("control NetworkPolicy has no {field}"))
+        };
+        Ok(Self {
+            uid: policy.metadata.uid.clone().ok_or_else(|| missing("UID"))?,
+            resource_version: policy
+                .metadata
+                .resource_version
+                .clone()
+                .ok_or_else(|| missing("resourceVersion"))?,
+            generation: policy
+                .metadata
+                .generation
+                .ok_or_else(|| missing("generation"))?,
+        })
+    }
+}
+
+/// Runtime annotations recorded once both Pods have UIDs, plus the control
+/// policy coordinates reconciliation compares for runtime-initiated control.
+fn sandbox_runtime_binding_annotations(
+    workload_pod_uid: &str,
+    supervisor_uid: &str,
+    fence_uid: &str,
+    fence_generation: i64,
+    control_policy: Option<&VerifiedControlPolicy>,
+) -> serde_json::Value {
+    let mut annotations = serde_json::json!({
+        ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: workload_pod_uid,
+        ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: supervisor_uid,
+        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: fence_uid,
+        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: fence_generation.to_string(),
+    });
+    if let Some(policy) = control_policy {
+        annotations[ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_UID] = policy.uid.clone().into();
+        annotations[ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_GENERATION] =
+            policy.generation.to_string().into();
+    }
+    annotations
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2120,6 +2197,11 @@ impl KubernetesComputeDriver {
             ANNOTATION_SANDBOX_RUNTIME_LOG_LEVEL.to_string(),
             log_level.clone(),
         );
+        let control_connection = self.config.sandbox_runtime.control_connection;
+        annotations.insert(
+            ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION.to_string(),
+            control_connection.as_str().to_string(),
+        );
         for key in [
             crate::config::ANNOTATION_SCC_UID_RANGE,
             crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS,
@@ -2182,6 +2264,7 @@ impl KubernetesComputeDriver {
                 &created,
                 &proxy_names,
                 &generation,
+                control_connection,
                 resolved_user_id,
                 resolved_group_id,
                 &main_process_spec,
@@ -2200,6 +2283,139 @@ impl KubernetesComputeDriver {
             }
         };
         Ok(runtime_identity)
+    }
+
+    /// Create or validate this sandbox's control egress policy and return the
+    /// stored coordinates bound into its boundary evidence.
+    async fn ensure_sandbox_runtime_control_policy(
+        &self,
+        namespace: &str,
+        names: &SandboxRuntimeNames,
+        sandbox_id: &str,
+        owner: OwnerReference,
+    ) -> Result<VerifiedControlPolicy, KubernetesDriverError> {
+        let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
+        let expected = control_policy(
+            namespace,
+            names,
+            sandbox_id,
+            self.config.sandbox_runtime.boundary_port,
+            owner,
+        );
+        create_or_validate_sandbox_runtime_fence(&policies, &expected).await?;
+        // Bind the coordinates of the object that was actually validated.
+        let stored = tokio::time::timeout(KUBE_API_TIMEOUT, policies.get(&names.control_policy))
+            .await
+            .map_err(|_| {
+                KubernetesDriverError::Message(
+                    "timed out reading sandbox-runtime control NetworkPolicy".to_string(),
+                )
+            })?
+            .map_err(KubernetesDriverError::from_kube)?;
+        validate_sandbox_runtime_fence(&stored, &expected)?;
+        VerifiedControlPolicy::from_policy(&stored)
+    }
+
+    fn sandbox_runtime_control_path(
+        &self,
+        namespace: &str,
+        names: &SandboxRuntimeNames,
+        service_ip: std::net::IpAddr,
+        control_policy: Option<VerifiedControlPolicy>,
+    ) -> KubernetesControlPath {
+        let port = self.config.sandbox_runtime.boundary_port;
+        let unspecified = std::net::SocketAddr::new(
+            if service_ip.is_ipv6() {
+                std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+            } else {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+            },
+            port,
+        );
+        let control_authority = boundary_service_authority(namespace, names, port);
+        let service_address = std::net::SocketAddr::new(service_ip, port);
+        match control_policy {
+            None => KubernetesControlPath::SupervisorInitiated {
+                boundary_listener: unspecified,
+                control_authority,
+                control_address: service_address,
+            },
+            Some(policy) => KubernetesControlPath::RuntimeInitiated {
+                control_authority,
+                supervisor_address: service_address,
+                supervisor_listen: unspecified,
+                control_policy_uid: policy.uid,
+                control_policy_resource_version: policy.resource_version,
+            },
+        }
+    }
+
+    /// Fail closed when a running sandbox's endpoint or control policy no
+    /// longer matches the mode recorded at creation. Returns `Precondition`
+    /// for drift that must suspend the workload.
+    async fn verify_sandbox_runtime_control_path(
+        &self,
+        object: &DynamicObject,
+        sandbox_id: &str,
+        namespace: &str,
+    ) -> Result<(), KubernetesDriverError> {
+        let mode = sandbox_runtime_control_connection(object)?;
+        let names = SandboxRuntimeNames::new(sandbox_id);
+        let services = Api::<Service>::namespaced(self.client.clone(), namespace);
+        let service =
+            tokio::time::timeout(KUBE_API_TIMEOUT, services.get_opt(&names.boundary_service))
+                .await
+                .map_err(|_| {
+                    KubernetesDriverError::Message(
+                        "timed out reading sandbox-runtime boundary Service".to_string(),
+                    )
+                })?
+                .map_err(KubernetesDriverError::from_kube)?;
+        // A missing Service is reported by supervisor reconciliation.
+        if let Some(service) = service
+            && !boundary_service_matches_mode(&service, sandbox_id, mode)
+        {
+            return Err(KubernetesDriverError::Precondition(format!(
+                "boundary Service {} no longer selects the {} listener",
+                names.boundary_service,
+                mode.as_str()
+            )));
+        }
+        if mode == KubernetesControlConnection::SupervisorInitiated {
+            return Ok(());
+        }
+        let policies = Api::<NetworkPolicy>::namespaced(self.client.clone(), namespace);
+        let stored =
+            tokio::time::timeout(KUBE_API_TIMEOUT, policies.get_opt(&names.control_policy))
+                .await
+                .map_err(|_| {
+                    KubernetesDriverError::Message(
+                        "timed out reading sandbox-runtime control NetworkPolicy".to_string(),
+                    )
+                })?
+                .map_err(KubernetesDriverError::from_kube)?
+                .ok_or_else(|| {
+                    KubernetesDriverError::Precondition(format!(
+                        "control NetworkPolicy {} is missing",
+                        names.control_policy
+                    ))
+                })?;
+        // Ownership is not part of enforcement; compare the spec and labels.
+        let expected = control_policy(
+            namespace,
+            &names,
+            sandbox_id,
+            self.config.sandbox_runtime.boundary_port,
+            OwnerReference::default(),
+        );
+        validate_sandbox_runtime_fence(&stored, &expected)?;
+        if !sandbox_runtime_control_policy_generation_matches(&stored, object) {
+            return Err(KubernetesDriverError::Precondition(format!(
+                "control NetworkPolicy {} changed after it was bound",
+                names.control_policy
+            )));
+        }
+        Ok(())
     }
 
     async fn create_sandbox_runtime_fence(
@@ -2482,6 +2698,7 @@ impl KubernetesComputeDriver {
         sandbox_cr: &DynamicObject,
         names: &SandboxRuntimeNames,
         _generation: &str,
+        control_connection: KubernetesControlConnection,
         agent_uid: u32,
         agent_gid: u32,
         main_process_spec: &str,
@@ -2520,6 +2737,7 @@ impl KubernetesComputeDriver {
                     names,
                     &sandbox.id,
                     self.config.sandbox_runtime.boundary_port,
+                    control_connection,
                     dependent_owner.clone(),
                 ),
             )
@@ -2601,6 +2819,18 @@ impl KubernetesComputeDriver {
                 "workload NetworkPolicy has no resourceVersion".to_string(),
             )
         })?;
+        let control_policy = match control_connection {
+            KubernetesControlConnection::SupervisorInitiated => None,
+            KubernetesControlConnection::RuntimeInitiated => Some(
+                self.ensure_sandbox_runtime_control_policy(
+                    namespace,
+                    names,
+                    &sandbox.id,
+                    dependent_owner.clone(),
+                )
+                .await?,
+            ),
+        };
 
         // Release the Sandbox CR only far enough for the controller to create
         // the workload Pod. The Pod remains unschedulable because its template
@@ -2637,16 +2867,18 @@ impl KubernetesComputeDriver {
         let workload_pod_name = workload_pod.metadata.name.clone().ok_or_else(|| {
             KubernetesDriverError::Message("workload Pod has no name".to_string())
         })?;
+        let binding_annotations = sandbox_runtime_binding_annotations(
+            &workload_pod_uid,
+            &supervisor_uid,
+            &fence_uid,
+            fence_generation,
+            control_policy.as_ref(),
+        );
         patch_dynamic_object_with_resource_version_retry(&sandbox_api.api, cr_name, |version| {
             serde_json::json!({
                 "metadata": {
                     "resourceVersion": version,
-                    "annotations": {
-                        ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: workload_pod_uid.clone(),
-                        ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: supervisor_uid.clone(),
-                        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: fence_uid.clone(),
-                        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: fence_generation.to_string(),
-                    }
+                    "annotations": binding_annotations.clone(),
                 }
             })
         })
@@ -2706,22 +2938,11 @@ impl KubernetesComputeDriver {
             supervisor_pod_uid: supervisor_uid.clone(),
             egress_policy_uid: fence_uid.clone(),
             egress_policy_resource_version: fence_resource_version.clone(),
-            boundary_listener: std::net::SocketAddr::new(
-                if service_ip.is_ipv6() {
-                    std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
-                } else {
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-                },
-                self.config.sandbox_runtime.boundary_port,
-            ),
-            control_authority: boundary_service_authority(
+            control_path: self.sandbox_runtime_control_path(
                 namespace,
                 names,
-                self.config.sandbox_runtime.boundary_port,
-            ),
-            control_address: std::net::SocketAddr::new(
                 service_ip,
-                self.config.sandbox_runtime.boundary_port,
+                control_policy,
             ),
             sandbox_tls: SandboxTlsServerConfig {
                 certificate_chain_path: PathBuf::from(BOUNDARY_CERTIFICATE_PATH),
@@ -2834,6 +3055,7 @@ impl KubernetesComputeDriver {
         cr_uid: &str,
         names: &SandboxRuntimeNames,
         _generation: &str,
+        control_connection: KubernetesControlConnection,
         supervisor_uid: &str,
         agent_uid: u32,
         agent_gid: u32,
@@ -2856,10 +3078,20 @@ impl KubernetesComputeDriver {
                 KubernetesDriverError::Message("sandbox namespace has no UID".to_string())
             })?;
         let services = Api::<Service>::namespaced(self.client.clone(), namespace);
-        let service_ip: std::net::IpAddr = services
+        let service = services
             .get(&names.boundary_service)
             .await
-            .map_err(KubernetesDriverError::from_kube)?
+            .map_err(KubernetesDriverError::from_kube)?;
+        // The Service and its selected role were fixed when the sandbox was
+        // created; restart must not reinterpret them under another mode.
+        if !boundary_service_matches_mode(&service, sandbox_id, control_connection) {
+            return Err(KubernetesDriverError::Precondition(format!(
+                "boundary Service {} does not select the {} listener recorded for this sandbox",
+                names.boundary_service,
+                control_connection.as_str()
+            )));
+        }
+        let service_ip: std::net::IpAddr = service
             .spec
             .and_then(|spec| spec.cluster_ip)
             .filter(|ip| ip != "None")
@@ -2888,6 +3120,23 @@ impl KubernetesComputeDriver {
                 "workload NetworkPolicy has no resourceVersion".to_string(),
             )
         })?;
+        let control_policy = match control_connection {
+            KubernetesControlConnection::SupervisorInitiated => None,
+            KubernetesControlConnection::RuntimeInitiated => Some(
+                self.ensure_sandbox_runtime_control_policy(
+                    namespace,
+                    names,
+                    sandbox_id,
+                    sandbox_runtime_sandbox_owner_reference(
+                        cr_name,
+                        cr_uid,
+                        &sandbox_api.resource.api_version,
+                        false,
+                    ),
+                )
+                .await?,
+            ),
+        };
 
         let pods = Api::<Pod>::namespaced(self.client.clone(), namespace);
         let workload_pod = self
@@ -2916,16 +3165,18 @@ impl KubernetesComputeDriver {
         let workload_pod_name = workload_pod.metadata.name.clone().ok_or_else(|| {
             KubernetesDriverError::Message("workload Pod has no name".to_string())
         })?;
+        let binding_annotations = sandbox_runtime_binding_annotations(
+            &workload_pod_uid,
+            supervisor_uid,
+            &fence_uid,
+            fence_generation,
+            control_policy.as_ref(),
+        );
         patch_dynamic_object_with_resource_version_retry(&sandbox_api.api, cr_name, |version| {
             serde_json::json!({
                 "metadata": {
                     "resourceVersion": version,
-                    "annotations": {
-                        ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: workload_pod_uid.clone(),
-                        ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: supervisor_uid,
-                        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: fence_uid.clone(),
-                        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: fence_generation.to_string(),
-                    }
+                    "annotations": binding_annotations.clone(),
                 }
             })
         })
@@ -2963,22 +3214,11 @@ impl KubernetesComputeDriver {
             supervisor_pod_uid: supervisor_uid.to_string(),
             egress_policy_uid: fence_uid.clone(),
             egress_policy_resource_version: fence_resource_version.clone(),
-            boundary_listener: std::net::SocketAddr::new(
-                if service_ip.is_ipv6() {
-                    std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
-                } else {
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-                },
-                self.config.sandbox_runtime.boundary_port,
-            ),
-            control_authority: boundary_service_authority(
+            control_path: self.sandbox_runtime_control_path(
                 namespace,
                 names,
-                self.config.sandbox_runtime.boundary_port,
-            ),
-            control_address: std::net::SocketAddr::new(
                 service_ip,
-                self.config.sandbox_runtime.boundary_port,
+                control_policy,
             ),
             sandbox_tls: SandboxTlsServerConfig {
                 certificate_chain_path: PathBuf::from(BOUNDARY_CERTIFICATE_PATH),
@@ -3325,6 +3565,7 @@ impl KubernetesComputeDriver {
             ));
         }
 
+        let control_connection = sandbox_runtime_control_connection(&object)?;
         let names = SandboxRuntimeNames::for_generation(sandbox_id, generation.as_str());
         self.create_sandbox_runtime_fence(&namespace, &names)
             .await?;
@@ -3466,6 +3707,7 @@ impl KubernetesComputeDriver {
                 cr_uid,
                 &names,
                 generation.as_str(),
+                control_connection,
                 &supervisor_uid,
                 agent_uid,
                 agent_gid,
@@ -3991,6 +4233,24 @@ impl KubernetesComputeDriver {
                 self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
                     .await;
                 continue;
+            }
+            if workload_may_run {
+                match self
+                    .verify_sandbox_runtime_control_path(&object, &sandbox_id, namespace)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(KubernetesDriverError::Precondition(error)) => {
+                        warn!(sandbox_id, %error, "sandbox-runtime control path drifted; suspending workload");
+                        self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
+                            .await;
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(sandbox_id, %error, "could not verify sandbox-runtime control path; reconciliation will retry");
+                        continue;
+                    }
+                }
             }
             if sandbox_runtime_bootstrap_in_progress(&object) {
                 if sandbox_runtime_control_availability(&self.client, namespace, &sandbox_id).await
@@ -7118,7 +7378,7 @@ fn validate_sandbox_runtime_fence(
     } else {
         let name = expected.metadata.name.as_deref().unwrap_or_default();
         Err(KubernetesDriverError::Precondition(format!(
-            "sandbox-runtime workload fence {name} exists but does not match the intended enforcement"
+            "sandbox-runtime NetworkPolicy {name} exists but does not match the intended enforcement"
         )))
     }
 }
@@ -7173,6 +7433,23 @@ fn sandbox_runtime_namespace_fence_generation_matches(
             .map(String::as_str)
         && annotations
             .get(ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION)
+            .and_then(|generation| generation.parse::<i64>().ok())
+            == policy.metadata.generation
+}
+
+fn sandbox_runtime_control_policy_generation_matches(
+    policy: &NetworkPolicy,
+    sandbox: &DynamicObject,
+) -> bool {
+    let Some(annotations) = sandbox.metadata.annotations.as_ref() else {
+        return false;
+    };
+    policy.metadata.uid.as_deref()
+        == annotations
+            .get(ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_UID)
+            .map(String::as_str)
+        && annotations
+            .get(ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_GENERATION)
             .and_then(|generation| generation.parse::<i64>().ok())
             == policy.metadata.generation
 }
@@ -8930,6 +9207,302 @@ mod tests {
             .expect("stop timed out")
             .expect("resume stop from Suspending");
         assert!(steps.lock().unwrap().is_empty());
+    }
+
+    fn scripted_control_driver(
+        steps: Vec<KubeTestStep>,
+    ) -> (
+        KubernetesComputeDriver,
+        Arc<std::sync::Mutex<VecDeque<KubeTestStep>>>,
+    ) {
+        let (driver, steps, _) = scripted_driver(KubernetesComputeConfig::default(), steps);
+        (driver, steps)
+    }
+
+    fn control_mode_object(annotations: &[(&str, &str)]) -> DynamicObject {
+        let mut object = sandbox_object_for_test("resource-uid", "sandbox-1");
+        object.metadata.annotations = Some(
+            annotations
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+        );
+        object
+    }
+
+    fn boundary_service_json(role: &str, publish_not_ready: bool) -> serde_json::Value {
+        let mut service = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "os-boundary-sandbox-1", "namespace": "openshell"},
+            "spec": {
+                "clusterIP": "10.43.0.7",
+                "selector": {BOUNDARY_PAIR_LABEL: "sandbox-1", BOUNDARY_ROLE_LABEL: role}
+            }
+        });
+        if publish_not_ready {
+            service["spec"]["publishNotReadyAddresses"] = true.into();
+        }
+        service
+    }
+
+    /// The Service each mode renders: runtime-initiated publishes the
+    /// supervisor before it is Ready.
+    fn boundary_service_response(role: &str) -> http::Response<kube::client::Body> {
+        kube_test_response(
+            http::StatusCode::OK,
+            boundary_service_json(role, role == "supervisor"),
+        )
+    }
+
+    fn stored_control_policy(generation: i64) -> NetworkPolicy {
+        let names = SandboxRuntimeNames::new("sandbox-1");
+        let mut policy = control_policy(
+            "openshell",
+            &names,
+            "sandbox-1",
+            5500,
+            OwnerReference::default(),
+        );
+        policy.metadata.uid = Some("control-uid".to_string());
+        policy.metadata.generation = Some(generation);
+        policy.metadata.resource_version = Some("77".to_string());
+        policy
+    }
+
+    type Annotations<'a> = &'a [(&'a str, &'a str)];
+
+    const SERVICE_PATH: &str = "/api/v1/namespaces/openshell/services/os-boundary-sandbox-1";
+    const CONTROL_POLICY_PATH: &str =
+        "/apis/networking.k8s.io/v1/namespaces/openshell/networkpolicies/os-control-sandbox-1";
+
+    #[test]
+    fn control_connection_is_read_from_the_sandbox_and_defaults_to_legacy() {
+        assert_eq!(
+            sandbox_runtime_control_connection(&control_mode_object(&[])).unwrap(),
+            KubernetesControlConnection::SupervisorInitiated
+        );
+        assert_eq!(
+            sandbox_runtime_control_connection(&control_mode_object(&[(
+                ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION,
+                "runtime-initiated"
+            )]))
+            .unwrap(),
+            KubernetesControlConnection::RuntimeInitiated
+        );
+        assert!(matches!(
+            sandbox_runtime_control_connection(&control_mode_object(&[(
+                ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION,
+                "Runtime-Initiated"
+            )])),
+            Err(KubernetesDriverError::Precondition(_))
+        ));
+    }
+
+    #[test]
+    fn binding_annotations_add_control_policy_only_for_runtime_initiated() {
+        let legacy = sandbox_runtime_binding_annotations("w", "s", "f", 3, None);
+        assert!(
+            legacy
+                .get(ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_UID)
+                .is_none()
+        );
+        let policy = VerifiedControlPolicy::from_policy(&stored_control_policy(4)).unwrap();
+        let runtime = sandbox_runtime_binding_annotations("w", "s", "f", 3, Some(&policy));
+        assert_eq!(
+            runtime[ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_UID],
+            "control-uid"
+        );
+        assert_eq!(
+            runtime[ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_GENERATION],
+            "4"
+        );
+        assert_eq!(
+            runtime[ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION],
+            "3"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_accepts_each_mode_with_its_own_endpoint() {
+        let (driver, steps) = scripted_control_driver(vec![(
+            http::Method::GET,
+            SERVICE_PATH,
+            boundary_service_response("workload"),
+        )]);
+        driver
+            .verify_sandbox_runtime_control_path(
+                &control_mode_object(&[]),
+                "sandbox-1",
+                "openshell",
+            )
+            .await
+            .expect("legacy sandbox with workload Service");
+        assert!(steps.lock().unwrap().is_empty());
+
+        let (driver, steps) = scripted_control_driver(vec![
+            (
+                http::Method::GET,
+                SERVICE_PATH,
+                boundary_service_response("supervisor"),
+            ),
+            (
+                http::Method::GET,
+                CONTROL_POLICY_PATH,
+                kube_test_response(
+                    http::StatusCode::OK,
+                    serde_json::to_value(stored_control_policy(4)).unwrap(),
+                ),
+            ),
+        ]);
+        driver
+            .verify_sandbox_runtime_control_path(
+                &control_mode_object(&[
+                    (
+                        ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION,
+                        "runtime-initiated",
+                    ),
+                    (ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_UID, "control-uid"),
+                    (ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_GENERATION, "4"),
+                ]),
+                "sandbox-1",
+                "openshell",
+            )
+            .await
+            .expect("runtime-initiated sandbox with bound control policy");
+        assert!(steps.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_fails_closed_on_service_or_control_policy_drift() {
+        let runtime_annotations = [
+            (
+                ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION,
+                "runtime-initiated",
+            ),
+            (ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_UID, "control-uid"),
+            (ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_GENERATION, "4"),
+        ];
+        let mut broadened = stored_control_policy(4);
+        broadened
+            .spec
+            .as_mut()
+            .unwrap()
+            .egress
+            .as_mut()
+            .unwrap()
+            .push(k8s_openapi::api::networking::v1::NetworkPolicyEgressRule::default());
+        let cases: Vec<(Annotations<'_>, Vec<KubeTestStep>)> = vec![
+            // A legacy sandbox's Service must keep selecting its workload.
+            (
+                &[],
+                vec![(
+                    http::Method::GET,
+                    SERVICE_PATH,
+                    boundary_service_response("supervisor"),
+                )],
+            ),
+            // A runtime-initiated Service must keep selecting its supervisor.
+            (
+                &runtime_annotations,
+                vec![(
+                    http::Method::GET,
+                    SERVICE_PATH,
+                    boundary_service_response("workload"),
+                )],
+            ),
+            // A runtime-initiated Service that withholds the not-Ready
+            // supervisor would deadlock bootstrap and recovery.
+            (
+                &runtime_annotations,
+                vec![(
+                    http::Method::GET,
+                    SERVICE_PATH,
+                    kube_test_response(
+                        http::StatusCode::OK,
+                        boundary_service_json("supervisor", false),
+                    ),
+                )],
+            ),
+            // The control policy was deleted.
+            (
+                &runtime_annotations,
+                vec![
+                    (
+                        http::Method::GET,
+                        SERVICE_PATH,
+                        boundary_service_response("supervisor"),
+                    ),
+                    (
+                        http::Method::GET,
+                        CONTROL_POLICY_PATH,
+                        kube_test_not_found("networkpolicies", "os-control-sandbox-1"),
+                    ),
+                ],
+            ),
+            // The control policy was broadened in place.
+            (
+                &runtime_annotations,
+                vec![
+                    (
+                        http::Method::GET,
+                        SERVICE_PATH,
+                        boundary_service_response("supervisor"),
+                    ),
+                    (
+                        http::Method::GET,
+                        CONTROL_POLICY_PATH,
+                        kube_test_response(
+                            http::StatusCode::OK,
+                            serde_json::to_value(&broadened).unwrap(),
+                        ),
+                    ),
+                ],
+            ),
+            // The control policy changed after it was bound.
+            (
+                &runtime_annotations,
+                vec![
+                    (
+                        http::Method::GET,
+                        SERVICE_PATH,
+                        boundary_service_response("supervisor"),
+                    ),
+                    (
+                        http::Method::GET,
+                        CONTROL_POLICY_PATH,
+                        kube_test_response(
+                            http::StatusCode::OK,
+                            serde_json::to_value(stored_control_policy(5)).unwrap(),
+                        ),
+                    ),
+                ],
+            ),
+            // An unknown recorded mode is never reinterpreted.
+            (
+                &[(
+                    ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION,
+                    "bidirectional",
+                )],
+                vec![],
+            ),
+        ];
+        for (index, (annotations, steps)) in cases.into_iter().enumerate() {
+            let (driver, remaining) = scripted_control_driver(steps);
+            let result = driver
+                .verify_sandbox_runtime_control_path(
+                    &control_mode_object(annotations),
+                    "sandbox-1",
+                    "openshell",
+                )
+                .await;
+            assert!(
+                matches!(result, Err(KubernetesDriverError::Precondition(_))),
+                "case {index}: {:?}",
+                result.err()
+            );
+            assert!(remaining.lock().unwrap().is_empty(), "case {index}");
+        }
     }
 
     #[test]

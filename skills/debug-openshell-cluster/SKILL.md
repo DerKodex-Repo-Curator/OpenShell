@@ -1010,10 +1010,42 @@ per-sandbox Service, split immutable bootstrap Secrets, and a gated supervisor
 Pod before releasing either Pod. The supervisor Pod runs
 `/openshell-supervisor`. Both Pods use the
 same resolved non-root identity, request no capabilities, drop `ALL`, disable
-privilege escalation, and use `RuntimeDefault` seccomp. The supervisor reaches
-the sandbox over per-sandbox TLS with server-certificate verification plus
-bootstrap-token client authentication, and owns gateway policy, provider
-credentials, DNS, and mediated upstream connections.
+privilege escalation, and use `RuntimeDefault` seccomp. The supervisor and
+sandbox talk over per-sandbox TLS with server-certificate verification plus
+bootstrap-token client authentication; the supervisor owns gateway policy,
+provider credentials, DNS, and mediated upstream connections.
+
+Each sandbox records which side opens that connection in the Sandbox annotation
+`openshell.ai/sandbox-runtime-control-connection`. A missing annotation means
+`supervisor-initiated`: the `os-boundary-<id>` Service selects the workload Pod
+and the supervisor dials it. With `runtime-initiated` (the default for new
+sandboxes), the Service selects the supervisor Pod, the sandbox runtime dials
+it, and a per-sandbox NetworkPolicy `os-control-<id>` admits only that
+connection at both the workload (egress) and the supervisor (ingress). The
+Service publishes the supervisor before it is Ready, because readiness follows
+the runtime's attach. If the runtime logs `cannot reach the supervisor`, check
+that the CNI applied both directions of `os-control-<id>`.
+Stop/start and gateway restarts keep the recorded mode. Check the mode first
+when a sandbox never becomes ready, especially after changing images or
+`sandbox_runtime.control_connection`:
+
+```bash
+kubectl -n <sandbox-namespace> get sandbox <sandbox-name> \
+  -o jsonpath='{.metadata.annotations.openshell\.ai/sandbox-runtime-control-connection}{"\n"}'
+kubectl -n <sandbox-namespace> get service os-boundary-<sandbox-id> -o jsonpath='{.spec.selector}{"\n"}'
+kubectl -n <sandbox-namespace> get networkpolicy os-control-<sandbox-id> -o yaml
+```
+
+A `runtime-initiated` sandbox needs a gateway, supervisor image, and sandbox
+runtime image that all support the mode. An older supervisor or runtime fails
+to decode its launch descriptor, so the sandbox cannot start or restart.
+Rolling the gateway or images back is unsupported for `runtime-initiated`
+sandboxes; running Pods keep their connection, but their next start fails.
+Upgrade the images, or set `control_connection = "supervisor-initiated"` for
+new sandboxes.
+Do not edit the annotation, Service selector, or `os-control-<id>` policy:
+reconciliation suspends a sandbox whose Service or control policy no longer
+matches its recorded mode.
 
 Inspect all driver-managed resources when a Kubernetes sandbox remains Starting
 or loses readiness:

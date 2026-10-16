@@ -81,7 +81,12 @@ The Skaffold flow builds distinct `gateway`, `sandbox`, and `supervisor` images
 and deploys the OpenShell Helm chart. The Kubernetes driver creates a
 capability-free workload Pod and a directly managed capability-free supervisor
 Pod. One namespace-wide NetworkPolicy denies direct egress from every OpenShell
-workload Pod. The
+workload Pod. New sandboxes default to `runtime-initiated` control: the sandbox
+runtime dials its supervisor Pod, and the driver adds a per-sandbox
+`os-control-<id>` NetworkPolicy for that path only. Set
+`gatewayConfig."openshell.drivers.kubernetes".sandbox_runtime.control_connection`
+to `supervisor-initiated` when testing with an older supervisor or sandbox
+runtime image. Existing sandboxes keep the mode recorded at creation. The
 `pkiInitJob` hook (a pre-install Job that runs `openshell-gateway generate-certs`)
 generates gateway and CLI TLS secrets on first install. Supervisor Pods project
 only `ca.crt` and authenticate gateway RPCs with sandbox bearer tokens. User

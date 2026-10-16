@@ -92,6 +92,15 @@ mod linux {
     const FORCE_KILL_REAP_TIMEOUT: Duration = Duration::from_secs(2);
     const MAX_PENDING_HANDSHAKES: usize = 32;
     const MAX_CONTROL_CONNECTIONS: usize = 128;
+    /// Bounds one runtime-initiated TCP connect attempt.
+    const RUNTIME_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+    const RUNTIME_DIAL_BACKOFF_MIN: Duration = Duration::from_millis(100);
+    const RUNTIME_DIAL_BACKOFF_MAX: Duration = Duration::from_secs(2);
+    /// A spare that dies this quickly without being claimed counts as a failure.
+    const RUNTIME_SPARE_MIN_LIFETIME: Duration = Duration::from_secs(1);
+    /// Consecutive dial failures are expected while the supervisor starts;
+    /// report a persistent failure at most this often.
+    const RUNTIME_DIAL_WARNING_INTERVAL: Duration = Duration::from_secs(30);
     const MAX_REPLAY_LEDGER_ENTRIES: usize = 4096;
     const MAX_RETAINED_EXEC_PROCESSES: usize = 64;
     // Three stdio pipes require six descriptors before fork, and Rust's
@@ -239,6 +248,10 @@ mod linux {
             .map_err(|error| format!("start sandbox workload launcher: {error}"))?;
         let protected_control_port = match &config.listener {
             BoundaryListenerConfig::TlsTcp { address, .. } => Some(address.port()),
+            // Validation requires every supervisor address to share one port.
+            BoundaryListenerConfig::RuntimeInitiatedTlsTcp { addresses, .. } => {
+                addresses.first().map(std::net::SocketAddr::port)
+            }
             BoundaryListenerConfig::Unix { .. } | BoundaryListenerConfig::Vsock { .. } => None,
         };
         let network_broker = NetworkBroker::start(listener, protected_control_port)
@@ -353,6 +366,11 @@ mod linux {
             } => {
                 return Err("boundary control port must be nonzero".to_string());
             }
+            BoundaryListenerConfig::RuntimeInitiatedTlsTcp {
+                authority,
+                addresses,
+                tls,
+            } => validate_runtime_initiated_targets(authority, addresses, tls)?,
             BoundaryListenerConfig::Unix { .. }
             | BoundaryListenerConfig::TlsTcp { .. }
             | BoundaryListenerConfig::Vsock { .. } => {}
@@ -386,6 +404,39 @@ mod linux {
                     "VM {field} '{selector}' conflicts with the resolved workload identity {}:{}; omit the selector or request the driver-owned identity",
                     identity.uid, identity.gid
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The dial target is driver-resolved bootstrap state, never workload
+    /// input. Loopback is refused because workloads share the loopback
+    /// interface and could otherwise receive the runtime's connection.
+    fn validate_runtime_initiated_targets(
+        authority: &str,
+        addresses: &[std::net::SocketAddr],
+        tls: &openshell_sandbox_backend::boundary_protocol::SandboxTlsServerConfig,
+    ) -> Result<(), String> {
+        let Some(first) = addresses.first() else {
+            return Err("runtime-initiated control requires a supervisor address".to_string());
+        };
+        if authority.is_empty() || !tls_paths_are_absolute(tls) {
+            return Err(
+                "runtime-initiated control requires an authority and absolute certificate paths"
+                    .to_string(),
+            );
+        }
+        for address in addresses {
+            let ip = address.ip().to_canonical();
+            if address.port() == 0
+                || address.port() != first.port()
+                || ip.is_unspecified()
+                || ip.is_loopback()
+            {
+                return Err(
+                    "runtime-initiated supervisor addresses must be concrete, non-loopback, and share one nonzero port"
+                        .to_string(),
+                );
             }
         }
         Ok(())
@@ -487,31 +538,42 @@ mod linux {
         Ok(())
     }
 
+    /// Shut down after SIGTERM/SIGINT; `None` while no termination is pending.
+    fn take_termination(runtime: &BoundaryRuntime) -> Option<Result<(), String>> {
+        if !BOUNDARY_TERMINATION_REQUESTED.load(Ordering::Acquire) {
+            return None;
+        }
+        let signal = BOUNDARY_TERMINATION_SIGNAL.load(Ordering::Acquire);
+        let before_supervisor_confirmation = !matches!(
+            *lock(&runtime.supervisor_connection),
+            SupervisorConnectionState::Connected(_)
+        );
+        runtime.shutdown();
+        if before_supervisor_confirmation {
+            return Some(Err(format!(
+                "sandbox boundary received {} before supervisor confirmation",
+                boundary_termination_signal_name(signal)
+            )));
+        }
+        tracing::info!(
+            signal = boundary_termination_signal_name(signal),
+            "Sandbox boundary received termination signal"
+        );
+        Some(Ok(()))
+    }
+
     fn serve(config: &BoundaryListenerConfig, runtime: Arc<BoundaryRuntime>) -> Result<(), String> {
+        if let BoundaryListenerConfig::RuntimeInitiatedTlsTcp { addresses, tls, .. } = config {
+            return serve_runtime_initiated(config, addresses.clone(), tls, runtime);
+        }
         let listener = ControlListener::bind(config)
             .map_err(|error| format!("bind boundary control listener: {error}"))?;
         let active_connections = Arc::new(AtomicUsize::new(0));
         let pending_handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
         tracing::info!(?config, "Boundary control listener ready");
         loop {
-            if BOUNDARY_TERMINATION_REQUESTED.load(Ordering::Acquire) {
-                let signal = BOUNDARY_TERMINATION_SIGNAL.load(Ordering::Acquire);
-                let before_supervisor_confirmation = !matches!(
-                    *lock(&runtime.supervisor_connection),
-                    SupervisorConnectionState::Connected(_)
-                );
-                runtime.shutdown();
-                if before_supervisor_confirmation {
-                    return Err(format!(
-                        "sandbox boundary received {} before supervisor confirmation",
-                        boundary_termination_signal_name(signal)
-                    ));
-                }
-                tracing::info!(
-                    signal = boundary_termination_signal_name(signal),
-                    "Sandbox boundary received termination signal"
-                );
-                return Ok(());
+            if let Some(result) = take_termination(&runtime) {
+                return result;
             }
             match listener.accept() {
                 Ok(stream) => {
@@ -553,6 +615,180 @@ mod linux {
                 }
                 Err(error) => return Err(format!("accept boundary control connection: {error}")),
             }
+        }
+    }
+
+    /// Runtime-initiated control: dial the supervisor instead of listening.
+    /// TLS server and gRPC server roles are the same as for a listener.
+    fn serve_runtime_initiated(
+        config: &BoundaryListenerConfig,
+        addresses: Vec<std::net::SocketAddr>,
+        tls: &openshell_sandbox_backend::boundary_protocol::SandboxTlsServerConfig,
+        runtime: Arc<BoundaryRuntime>,
+    ) -> Result<(), String> {
+        let server_config = Arc::new(
+            load_tls_server_config(tls)
+                .map_err(|error| format!("load boundary TLS identity: {error}"))?,
+        );
+        tracing::info!(?config, "Boundary control dialer ready");
+        let dialer = runtime.process_runtime.spawn(run_runtime_initiated_control(
+            addresses,
+            server_config,
+            runtime.clone(),
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        loop {
+            if let Some(result) = take_termination(&runtime) {
+                dialer.abort();
+                return result;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Keep exactly one unclaimed spare connection open to the supervisor.
+    ///
+    /// The supervisor claims a spare by starting HTTP/2 on it; then the next
+    /// spare is dialed so credential rotation and recovery, which open a new
+    /// connection before retiring the old one, never wait on this loop. Live
+    /// connections keep the existing disconnect, freeze, and termination path.
+    async fn run_runtime_initiated_control(
+        addresses: Vec<std::net::SocketAddr>,
+        server_config: Arc<rustls::ServerConfig>,
+        runtime: Arc<BoundaryRuntime>,
+        active_connections: Arc<AtomicUsize>,
+    ) {
+        let mut backoff = RUNTIME_DIAL_BACKOFF_MIN;
+        let mut first_failure: Option<tokio::time::Instant> = None;
+        let mut last_warning: Option<tokio::time::Instant> = None;
+        loop {
+            let Some(slot) = acquire_control_connection_slot(&active_connections) else {
+                tokio::time::sleep(RUNTIME_DIAL_BACKOFF_MAX).await;
+                continue;
+            };
+            let dialed_at = tokio::time::Instant::now();
+            let stream = match dial_runtime_initiated(&addresses, server_config.clone()).await {
+                Ok(stream) => {
+                    first_failure = None;
+                    stream
+                }
+                Err(error) => {
+                    let now = tokio::time::Instant::now();
+                    let failing_since = *first_failure.get_or_insert(now);
+                    if now.duration_since(failing_since) >= RUNTIME_DIAL_WARNING_INTERVAL
+                        && last_warning.is_none_or(|last| {
+                            now.duration_since(last) >= RUNTIME_DIAL_WARNING_INTERVAL
+                        })
+                    {
+                        last_warning = Some(now);
+                        tracing::warn!(
+                            %error,
+                            failing_for_secs = now.duration_since(failing_since).as_secs(),
+                            "Runtime-initiated control cannot reach the supervisor; retrying"
+                        );
+                    } else {
+                        tracing::debug!(%error, "Runtime-initiated control dial failed; retrying");
+                    }
+                    drop(slot);
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(RUNTIME_DIAL_BACKOFF_MAX);
+                    continue;
+                }
+            };
+            let (claimed, claim) = tokio::sync::oneshot::channel();
+            runtime.process_runtime.spawn({
+                let runtime = runtime.clone();
+                async move {
+                    let _slot = slot;
+                    let stream = Box::new(ClaimOnFirstRead {
+                        inner: stream,
+                        claimed: Some(claimed),
+                    });
+                    if let Err(error) =
+                        serve_grpc(stream, runtime, SandboxConnectionId::new()).await
+                    {
+                        tracing::debug!(%error, "Boundary control connection ended");
+                    }
+                }
+            });
+            if claim.await.is_ok() || dialed_at.elapsed() >= RUNTIME_SPARE_MIN_LIFETIME {
+                backoff = RUNTIME_DIAL_BACKOFF_MIN;
+            } else {
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(RUNTIME_DIAL_BACKOFF_MAX);
+            }
+        }
+    }
+
+    async fn dial_runtime_initiated(
+        addresses: &[std::net::SocketAddr],
+        server_config: Arc<rustls::ServerConfig>,
+    ) -> io::Result<openshell_isolation_interface::contract::BoundaryDuplexStream> {
+        let stream = tokio::time::timeout(
+            RUNTIME_DIAL_TIMEOUT,
+            openshell_core::net::connect_tcp_nodelay_best_effort(addresses),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "supervisor dial timed out"))??;
+        // An idle spare must notice a silently lost supervisor well inside the
+        // authenticated recovery window.
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(10))
+            .with_interval(Duration::from_secs(5))
+            .with_retries(3);
+        let _ = socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive);
+        let stream = tokio::time::timeout(
+            CONTROL_HANDSHAKE_TIMEOUT,
+            tokio_rustls::TlsAcceptor::from(server_config).accept(stream),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "boundary TLS handshake timed out"))?
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(Box::new(stream))
+    }
+
+    /// Signals once the supervisor sends its first application bytes.
+    struct ClaimOnFirstRead {
+        inner: openshell_isolation_interface::contract::BoundaryDuplexStream,
+        claimed: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl tokio::io::AsyncRead for ClaimOnFirstRead {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let before = buffer.filled().len();
+            let result = Pin::new(&mut self.inner).poll_read(context, buffer);
+            if matches!(result, Poll::Ready(Ok(())))
+                && buffer.filled().len() > before
+                && let Some(claimed) = self.claimed.take()
+            {
+                let _ = claimed.send(());
+            }
+            result
+        }
+    }
+
+    impl tokio::io::AsyncWrite for ClaimOnFirstRead {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(context, buffer)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(context)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(context)
         }
     }
 
@@ -3364,6 +3600,10 @@ mod linux {
                         server_config,
                     })
                 }
+                BoundaryListenerConfig::RuntimeInitiatedTlsTcp { .. } => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "runtime-initiated control dials the supervisor and binds no listener",
+                )),
                 BoundaryListenerConfig::TlsTcp { address, tls } => {
                     let (listener, reject_local_peers) = Self::bind_tcp(*address)?;
                     listener.set_nonblocking(true)?;
@@ -5518,6 +5758,96 @@ mod linux {
                     .expect("decode logical response");
             assert!(matches!(response.response, Response::Attached { .. }));
             server.abort();
+        }
+
+        #[test]
+        fn runtime_initiated_targets_must_be_concrete_remote_and_single_port() {
+            let tls = placeholder_server_tls();
+            let address = |value: &str| value.parse::<std::net::SocketAddr>().unwrap();
+            assert!(
+                validate_runtime_initiated_targets(
+                    "os-boundary-a.ns.svc:5500",
+                    &[address("10.43.0.9:5500"), address("[fd00::9]:5500")],
+                    &tls
+                )
+                .is_ok()
+            );
+            for addresses in [
+                vec![],
+                vec![address("127.0.0.1:5500")],
+                vec![address("[::ffff:127.0.0.1]:5500")],
+                vec![address("0.0.0.0:5500")],
+                vec![address("10.43.0.9:0")],
+                vec![address("10.43.0.9:5500"), address("10.43.0.10:5501")],
+            ] {
+                assert!(
+                    validate_runtime_initiated_targets(
+                        "os-boundary-a.ns.svc:5500",
+                        &addresses,
+                        &tls
+                    )
+                    .is_err(),
+                    "{addresses:?}"
+                );
+            }
+            assert!(
+                validate_runtime_initiated_targets("", &[address("10.43.0.9:5500")], &tls).is_err()
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn runtime_initiated_control_keeps_one_spare_and_redials_after_loss() {
+            let (runtime, _token) = availability_test_runtime();
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let (server_tls, client_tls) = stage_test_tls(directory.path(), "dial");
+            let server_config =
+                Arc::new(load_tls_server_config(&server_tls).expect("load TLS identity"));
+            let supervisor = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let dialer = tokio::spawn(run_runtime_initiated_control(
+                vec![supervisor.local_addr().unwrap()],
+                server_config,
+                runtime,
+                Arc::new(AtomicUsize::new(0)),
+            ));
+            let connector =
+                tokio_rustls::TlsConnector::from(Arc::new(test_client_config(&client_tls)));
+            let server_name =
+                rustls::pki_types::ServerName::try_from(client_tls.server_name.clone()).unwrap();
+            let accept_authenticated = || async {
+                let (stream, _) = tokio::time::timeout(Duration::from_secs(5), supervisor.accept())
+                    .await
+                    .expect("runtime dials the supervisor")
+                    .unwrap();
+                connector
+                    .connect(server_name.clone(), stream)
+                    .await
+                    .expect("runtime presents its pinned identity")
+            };
+            let no_new_dial = || async {
+                tokio::time::timeout(Duration::from_millis(400), supervisor.accept())
+                    .await
+                    .is_err()
+            };
+
+            let mut first = accept_authenticated().await;
+            assert!(no_new_dial().await, "an unclaimed spare suppresses dialing");
+
+            // Starting HTTP/2 claims the spare; the runtime dials a new one.
+            first
+                .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                .await
+                .unwrap();
+            first.flush().await.unwrap();
+            let spare = accept_authenticated().await;
+            assert!(no_new_dial().await, "only one spare is kept");
+
+            // Losing the claimed connection does not add spares; losing the
+            // spare is repaired by a redial.
+            drop(first);
+            assert!(no_new_dial().await);
+            drop(spare);
+            let _replacement = accept_authenticated().await;
+            dialer.abort();
         }
 
         #[test]

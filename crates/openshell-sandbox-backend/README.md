@@ -102,6 +102,25 @@ retain generation, session, resource, identity, and provisioning evidence checks
 
 ## Boundary transport establishment
 
-The client connects to the configured Unix socket, TCP, or vsock endpoint. It
-owns TLS peer verification, session bearer authentication, generation checks,
-and reconnection handling for policy discovery and attachment.
+Backends may supply a `BoundaryTransportConnector` for raw stream establishment.
+The shared client retains TLS peer verification, session bearer authentication,
+generation checks, and reconnection handling. The connector is reused for policy
+discovery and attachment; it does not define platform launch configuration or
+replace the isolation interface.
+
+### Runtime-initiated transport
+
+`SandboxTransport::RuntimeInitiatedTcp` and
+`BoundaryListener::RuntimeInitiatedTlsTcp` reverse only the TCP dial: the
+sandbox runtime connects to the supervisor, then remains the TLS server and gRPC
+server. The supervisor binds one `RuntimeInitiatedListener` per sandbox session
+and shares it between policy discovery and attachment. The listener completes
+TLS with the descriptor's pinned identity before it queues a stream, bounds
+concurrent unauthenticated handshakes and their duration, and keeps at most two
+unclaimed authenticated streams. The client wraps each stream in the same
+abortable transport as dialed connections, so cancellation closes the socket.
+The runtime keeps one unclaimed spare connection open so reconnects and
+credential rotation never wait for a new dial.
+
+The new variants leave existing encodings unchanged. Binaries that predate them
+reject runtime-initiated descriptors instead of falling back to another mode.
