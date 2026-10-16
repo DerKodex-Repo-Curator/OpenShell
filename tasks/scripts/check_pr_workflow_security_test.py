@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -688,17 +690,13 @@ def test_manual_integration_uses_the_exact_candidate_artifact_run() -> None:
     assert resolve["env"]["ARTIFACT_RUN_ID_INPUT"] == (
         "${{ inputs['artifact-run-id'] }}"
     )
-    assert '[ -n "$ARTIFACT_RUN_ID_INPUT" ] && [ -z "$SOURCE_SHA" ]' in (
-        resolve["run"]
-    )
+    assert '[ -n "$ARTIFACT_RUN_ID_INPUT" ] && [ -z "$SOURCE_SHA" ]' in (resolve["run"])
     checkout = next(
         step
         for step in prepare_steps
         if str(step.get("uses", "")).startswith("actions/checkout@")
     )
-    assert checkout["with"]["ref"] == (
-        "${{ steps.artifact-run.outputs.source_sha }}"
-    )
+    assert checkout["with"]["ref"] == ("${{ steps.artifact-run.outputs.source_sha }}")
     image_loader = next(
         step
         for step in prepare_steps
@@ -726,3 +724,77 @@ def test_label_help_never_checks_out_candidate_code() -> None:
     )
     assert "pull-request/" not in text
     assert "/ok to test $PR_HEAD_SHA" in text
+
+
+def test_prebuilt_e2e_binaries_use_outputs_without_mutating_job_env(
+    tmp_path: Path,
+) -> None:
+    actions = {
+        "cli": ("openshell", "OPENSHELL_BIN"),
+        "gateway": ("openshell-gateway", "OPENSHELL_GATEWAY_BIN"),
+        "vm-driver": ("openshell-driver-vm", "OPENSHELL_VM_DRIVER_BIN"),
+    }
+    workspace = tmp_path / "workspace with spaces"
+    workspace.mkdir()
+    environment_file = tmp_path / "environment"
+    environment_file.write_text("PRESERVE_EXISTING=value\n", encoding="utf-8")
+    for action, (binary_name, _) in actions.items():
+        definition = load_workflow(f".github/actions/setup-e2e-{action}/action.yml")
+        output_ref = re.fullmatch(
+            r"\$\{\{ steps\.([\w-]+)\.outputs\.([\w-]+) \}\}",
+            definition["outputs"]["binary"]["value"],
+        )
+        assert output_ref is not None
+        configure = next(
+            step
+            for step in definition["runs"]["steps"]
+            if step.get("id") == output_ref[1]
+        )
+        download = next(
+            step
+            for step in definition["runs"]["steps"]
+            if step.get("uses", "").startswith("actions/download-artifact@")
+        )
+        binary = workspace / download["with"]["path"] / binary_name
+        binary.parent.mkdir(parents=True)
+        binary.write_text("#!/bin/sh\nprintf 'fixture-version\\n'\n", encoding="utf-8")
+        output_file = tmp_path / f"{action}.output"
+        output_file.touch()
+        subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", configure["run"]],
+            env={
+                **os.environ,
+                "GITHUB_WORKSPACE": str(workspace),
+                "GITHUB_OUTPUT": str(output_file),
+                "GITHUB_ENV": str(environment_file),
+            },
+            check=True,
+            capture_output=True,
+        )
+        outputs = dict(
+            line.split("=", 1) for line in output_file.read_text().splitlines()
+        )
+        assert outputs[output_ref[2]] == str(binary)
+        assert os.access(binary, os.X_OK)
+        subprocess.run(
+            [outputs[output_ref[2]], "--version"], check=True, capture_output=True
+        )
+        assert environment_file.read_text() == "PRESERVE_EXISTING=value\n"
+
+    callers = set()
+    for relative_path in PR_REUSABLE_WORKFLOWS:
+        workflow = load_workflow(relative_path)
+        for job in workflow["jobs"].values():
+            steps = job.get("steps", [])
+            for action, (_, variable) in actions.items():
+                for index, step in enumerate(steps):
+                    if step.get("uses") != f"$/.github/actions/setup-e2e-{action}":
+                        continue
+                    callers.add(relative_path)
+                    expected = "${{ steps." + step["id"] + ".outputs.binary }}"
+                    assert any(
+                        consumer.get("env", {}).get(variable) == expected
+                        and "run" in consumer
+                        for consumer in steps[index + 1 :]
+                    ), (relative_path, action)
+    assert len(callers) == 5

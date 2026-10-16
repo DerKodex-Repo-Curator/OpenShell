@@ -82,9 +82,11 @@ jobs:
           engine: docker
           image-tag: ${{ inputs.image-tag }}
 
-      - uses: $/.github/actions/setup-e2e-cli
+      - id: prebuilt-cli
+        uses: $/.github/actions/setup-e2e-cli
 
-      - uses: $/.github/actions/setup-e2e-gateway
+      - id: prebuilt-gateway
+        uses: $/.github/actions/setup-e2e-gateway
         with:
           artifact-name: ${{ inputs.gateway-artifact }}
 
@@ -123,5 +125,7 @@ jobs:
 
       - name: Run tests
         env:
+          OPENSHELL_BIN: ${{ steps.prebuilt-cli.outputs.binary }}
+          OPENSHELL_GATEWAY_BIN: ${{ steps.prebuilt-gateway.outputs.binary }}
           OPENSHELL_MCP_CONFORMANCE_CLIENT_IMAGE: ${{ format('openshell-mcp-conformance-client:{0}', inputs.image-tag) }}
         run: ${{ matrix.cmd }}

@@ -85,9 +85,11 @@ jobs:
 
       - name: Use prebuilt OpenShell CLI
         uses: $/.github/actions/setup-e2e-cli
+        id: prebuilt-cli
 
       - name: Use prebuilt OpenShell gateway
         uses: $/.github/actions/setup-e2e-gateway
+        id: prebuilt-gateway
 
       - name: Log in to GHCR
         if: inputs.use-image-artifacts == false
@@ -105,4 +107,7 @@ jobs:
         run: mise run --no-deps --skip-deps e2e:workloads:build
 
       - name: Run tests
+        env:
+          OPENSHELL_BIN: ${{ steps.prebuilt-cli.outputs.binary }}
+          OPENSHELL_GATEWAY_BIN: ${{ steps.prebuilt-gateway.outputs.binary }}
         run: mise run --no-deps --skip-deps e2e:docker:gpu

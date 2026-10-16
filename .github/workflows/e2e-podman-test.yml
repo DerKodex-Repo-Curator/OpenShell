@@ -61,9 +61,11 @@ jobs:
           ref: ${{ inputs.checkout-ref || github.sha }}
           persist-credentials: false
 
-      - uses: $/.github/actions/setup-e2e-cli
+      - id: prebuilt-cli
+        uses: $/.github/actions/setup-e2e-cli
 
-      - uses: $/.github/actions/setup-e2e-gateway
+      - id: prebuilt-gateway
+        uses: $/.github/actions/setup-e2e-gateway
         with:
           artifact-name: ${{ inputs.gateway-artifact }}
 
@@ -89,6 +91,9 @@ jobs:
         run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
 
       - name: Run tests
+        env:
+          OPENSHELL_BIN: ${{ steps.prebuilt-cli.outputs.binary }}
+          OPENSHELL_GATEWAY_BIN: ${{ steps.prebuilt-gateway.outputs.binary }}
         run: ${{ matrix.cmd }}
 
       - name: Print AppArmor denials
