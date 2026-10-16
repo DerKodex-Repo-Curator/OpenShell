@@ -176,6 +176,9 @@ PR descriptions must follow the project's [PR template](.github/PULL_REQUEST_TEM
 ## Changes
 <!-- Bullet list of key changes -->
 
+## Release Notes
+<!-- Optional: concise, user-facing wording for the release -->
+
 ## Testing
 <!-- What testing was done? -->
 - [ ] Checks appropriate to the affected code and behavior pass
@@ -188,6 +191,7 @@ PR descriptions must follow the project's [PR template](.github/PULL_REQUEST_TEM
 ```
 
 Populate the testing checklist based on what was actually run. Check boxes for steps that were completed.
+Leave the Release Notes section empty when the summary already captures the user-facing change.
 
 ## Example PR (Complete)
 
@@ -208,6 +212,10 @@ Closes #456
 - Added `page_size` and `page_token` fields to the sandbox list API call
 - Default page size is 100, max is 1,000
 - Structured responses include `next_page_token`
+
+## Release Notes
+
+Sandbox list results can now be paged through with `--page-size` and `--page-token`.
 
 ## Testing
 
