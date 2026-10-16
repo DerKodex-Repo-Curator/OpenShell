@@ -105,13 +105,15 @@ enforcement, so operators must verify CNI support before running sandboxes.
 
 ### Control connection direction
 
-Each sandbox records which side opens its Sandbox Protocol TCP connection in
-the Sandbox annotation `openshell.ai/sandbox-runtime-control-connection`,
-written once at creation from `sandbox_runtime.control_connection` (default
-`runtime-initiated`). A sandbox without the annotation was created before the
-mode existed and is `supervisor-initiated`. Start, gateway-restart recovery,
-and image upgrades read the annotation and never apply the current default, so
-both modes run side by side in one namespace. An unknown value fails closed.
+Every new runtime generation uses `runtime-initiated` control. The Sandbox
+annotation `openshell.ai/sandbox-runtime-control-connection` records the current
+generation's mode. A missing annotation identifies a legacy,
+`supervisor-initiated` generation, which keeps working until replaced. Stop/start
+upgrades it automatically: with both old Pods removed, the driver changes the
+Service selector in place, preserves its ClusterIP, and records the new mode
+before releasing the replacement workload. Gateway recovery that recreates both
+Pods also upgrades the generation. Reconciliation never migrates a running
+generation. An unknown annotation value fails closed; there is no rollout flag.
 
 Only the dial direction differs. In both modes the sandbox runtime presents the
 generation-pinned TLS server identity and serves gRPC, and the supervisor

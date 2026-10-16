@@ -1018,16 +1018,17 @@ provider credentials, DNS, and mediated upstream connections.
 Each sandbox records which side opens that connection in the Sandbox annotation
 `openshell.ai/sandbox-runtime-control-connection`. A missing annotation means
 `supervisor-initiated`: the `os-boundary-<id>` Service selects the workload Pod
-and the supervisor dials it. With `runtime-initiated` (the default for new
-sandboxes), the Service selects the supervisor Pod, the sandbox runtime dials
+and the supervisor dials it. With `runtime-initiated` (used for new
+generations), the Service selects the supervisor Pod, the sandbox runtime dials
 it, and a per-sandbox NetworkPolicy `os-control-<id>` admits only that
 connection at both the workload (egress) and the supervisor (ingress). The
 Service publishes the supervisor before it is Ready, because readiness follows
 the runtime's attach. If the runtime logs `cannot reach the supervisor`, check
 that the CNI applied both directions of `os-control-<id>`.
-Stop/start and gateway restarts keep the recorded mode. Check the mode first
-when a sandbox never becomes ready, especially after changing images or
-`sandbox_runtime.control_connection`:
+Stop/start upgrades legacy sandboxes to runtime-initiated control, as does
+gateway recovery that recreates both Pods. Existing running generations keep
+their current connection until replaced. Check the mode first when a sandbox
+never becomes ready, especially after changing images:
 
 ```bash
 kubectl -n <sandbox-namespace> get sandbox <sandbox-name> \
@@ -1041,8 +1042,12 @@ runtime image that all support the mode. An older supervisor or runtime fails
 to decode its launch descriptor, so the sandbox cannot start or restart.
 Rolling the gateway or images back is unsupported for `runtime-initiated`
 sandboxes; running Pods keep their connection, but their next start fails.
-Upgrade the images, or set `control_connection = "supervisor-initiated"` for
-new sandboxes.
+Upgrade the images together. There is no legacy rollout flag.
+Migrating a legacy endpoint on restart also requires `patch` on Services in the
+sandbox namespace. Helm grants it through the shared-mode Role or the managed
+and operator-mode ClusterRole. For a `Forbidden` restart error, check the
+gateway ServiceAccount with `kubectl auth can-i patch services --namespace
+<sandbox-namespace> --as system:serviceaccount:<gateway-namespace>:<gateway-service-account>`.
 Do not edit the annotation, Service selector, or `os-control-<id>` policy:
 reconciliation suspends a sandbox whose Service or control policy no longer
 matches its recorded mode.

@@ -299,7 +299,7 @@ Only the OpenShell gateway and the Agent Sandbox controller should be able to ma
 | `proxy_auth_secret_name` / `proxy_auth_secret_key` | `upstreamProxy.authSecret.name` / `.key` | Secret holding the proxy `user:pass` credential. |
 | `proxy_ca_bundle` | `upstreamProxy.caBundle.configMapName` / `.key` | ConfigMap with the proxy's CA certificate. |
 
-New Kubernetes sandboxes default to a runtime-initiated control connection, which needs a supervisor image and sandbox runtime image that support it. If you override either image with an older version, first set `gatewayConfig["openshell.drivers.kubernetes"].sandbox_runtime.control_connection` to `supervisor-initiated`. Existing sandboxes keep their mode. See [Sandbox Control Connection](/how-it-works/gateways/configuration#sandbox-control-connection).
+New and restarted Kubernetes sandboxes use a runtime-initiated control connection automatically. Existing running generations keep their current connection until replaced. Deploy compatible gateway, supervisor, and sandbox runtime images together. See [Sandbox Control Connection](/how-it-works/gateways/configuration#sandbox-control-connection).
 
 For the full list, see the [Gateway Configuration File](/how-it-works/gateways/configuration) reference.
 

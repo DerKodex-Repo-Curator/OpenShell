@@ -12,9 +12,8 @@ use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_kubernetes::{
     ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
-    KubernetesComputeConfig, KubernetesComputeDriver, KubernetesControlConnection,
-    KubernetesImagePullPolicy, KubernetesSandboxRuntimeConfig, ManagedSshIngressConfig,
-    WorkspaceMode,
+    KubernetesComputeConfig, KubernetesComputeDriver, KubernetesImagePullPolicy,
+    KubernetesSandboxRuntimeConfig, ManagedSshIngressConfig, WorkspaceMode,
 };
 
 #[derive(Parser, Debug)]
@@ -158,14 +157,6 @@ struct Args {
     )]
     sandbox_runtime_boundary_port: u16,
 
-    /// Sandbox Protocol connection mode recorded on newly created sandboxes.
-    #[arg(
-        long,
-        env = "OPENSHELL_K8S_SANDBOX_RUNTIME_CONTROL_CONNECTION",
-        default_value = "runtime-initiated"
-    )]
-    sandbox_runtime_control_connection: KubernetesControlConnection,
-
     /// Corporate HTTP forward proxy for policy-approved TLS CONNECT egress.
     #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY")]
     https_proxy: Option<String>,
@@ -295,7 +286,6 @@ async fn main() -> Result<()> {
             supervisor_image_pull_policy: args.supervisor_image_pull_policy,
             sandbox_runtime: KubernetesSandboxRuntimeConfig {
                 boundary_port: args.sandbox_runtime_boundary_port,
-                control_connection: args.sandbox_runtime_control_connection,
             },
             https_proxy: args.https_proxy,
             no_proxy: args.no_proxy,

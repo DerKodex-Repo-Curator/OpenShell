@@ -76,9 +76,9 @@ pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 
 /// Which side opens the Sandbox Protocol TCP connection.
 ///
-/// Recorded on each Sandbox resource at creation. Existing sandboxes keep their
-/// recorded mode across stop/start, restarts, and upgrades; a sandbox created
-/// before this setting existed is `SupervisorInitiated`.
+/// Internal state for the current runtime generation. A missing Sandbox
+/// annotation identifies a legacy generation; every new generation uses
+/// `RuntimeInitiated`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum KubernetesControlConnection {
@@ -121,16 +121,12 @@ pub struct KubernetesSandboxRuntimeConfig {
     /// TCP port of the Sandbox Protocol listener: the workload boundary for
     /// supervisor-initiated sandboxes, the supervisor for runtime-initiated ones.
     pub boundary_port: u16,
-    /// Connection mode recorded on sandboxes created from now on. Changing it
-    /// never migrates an existing sandbox.
-    pub control_connection: KubernetesControlConnection,
 }
 
 impl Default for KubernetesSandboxRuntimeConfig {
     fn default() -> Self {
         Self {
             boundary_port: 5500,
-            control_connection: KubernetesControlConnection::default(),
         }
     }
 }

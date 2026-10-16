@@ -185,8 +185,8 @@ pub fn workload_fence(
 }
 
 /// Per-sandbox Sandbox Protocol endpoint. Its stable `ClusterIP` is allocated
-/// before either Pod runs; the selected role follows the sandbox's recorded
-/// connection mode and never changes for the sandbox's lifetime.
+/// before either Pod runs; the selected role follows the current generation's
+/// connection mode. A legacy endpoint is upgraded when both Pods are replaced.
 #[must_use]
 pub fn boundary_service(
     namespace: &str,

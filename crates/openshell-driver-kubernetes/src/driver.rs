@@ -107,8 +107,8 @@ const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: &str =
     "openshell.ai/sandbox-runtime-network-policy-uid";
 const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: &str =
     "openshell.ai/sandbox-runtime-network-policy-generation";
-/// Durable, creation-time Sandbox Protocol connection mode. Absent on
-/// sandboxes created before the mode existed, which are supervisor-initiated.
+/// Connection mode of the current runtime generation. Absent on legacy
+/// generations, which remain supervisor-initiated until they are replaced.
 const ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION: &str =
     "openshell.ai/sandbox-runtime-control-connection";
 const ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_UID: &str =
@@ -156,8 +156,7 @@ fn boundary_service_authority(
     )
 }
 
-/// Read the connection mode recorded when the sandbox was created. Starting a
-/// sandbox never consults the current creation default.
+/// Read the current generation's mode without migrating a running workload.
 fn sandbox_runtime_control_connection(
     object: &DynamicObject,
 ) -> Result<KubernetesControlConnection, KubernetesDriverError> {
@@ -2180,7 +2179,7 @@ impl KubernetesComputeDriver {
             ANNOTATION_SANDBOX_RUNTIME_LOG_LEVEL.to_string(),
             log_level.clone(),
         );
-        let control_connection = self.config.sandbox_runtime.control_connection;
+        let control_connection = KubernetesControlConnection::RuntimeInitiated;
         annotations.insert(
             ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION.to_string(),
             control_connection.as_str().to_string(),
@@ -2333,7 +2332,7 @@ impl KubernetesComputeDriver {
     }
 
     /// Fail closed when a sandbox's boundary Service or control policy no
-    /// longer matches the mode recorded at creation. This is the reconcile
+    /// longer matches the mode recorded for its generation. This is the reconcile
     /// pass's only Service read; a missing Service is drift once the sandbox
     /// should be running. Returns `Precondition` for drift that must suspend.
     async fn verify_sandbox_runtime_control_path(
@@ -2904,8 +2903,7 @@ impl KubernetesComputeDriver {
             .get(&names.boundary_service)
             .await
             .map_err(KubernetesDriverError::from_kube)?;
-        // The Service and its selected role were fixed when the sandbox was
-        // created; restart must not reinterpret them under another mode.
+        // Running generations must retain the Service role prepared for them.
         if !boundary_service_matches_mode(&service, sandbox_id, control_connection) {
             return Err(KubernetesDriverError::Precondition(format!(
                 "boundary Service {} does not select the {} listener recorded for this sandbox",
@@ -3360,16 +3358,17 @@ impl KubernetesComputeDriver {
             &namespace,
         );
         let pods = Api::<Pod>::namespaced(self.client.clone(), &namespace);
-        if pods
+        let workload_exists = pods
             .get_opt(cr_name)
             .await
             .map_err(KubernetesDriverError::from_kube)?
-            .is_some()
-        {
+            .is_some();
+        if workload_exists || sandbox_runtime_should_run(&object) {
             if !encoded_authentication.is_empty() {
                 // Gateway restart creates a fresh in-memory launch session.
-                // Recreate both Pods so neither side retains credentials for
-                // the gateway instance that was replaced.
+                // Suspend the controller and recreate both Pods so neither
+                // side retains credentials for the replaced gateway. Suspend
+                // even if the old workload Pod disappeared before this call.
                 self.stop_sandbox_inner(sandbox_id).await?;
                 return Box::pin(self.start_sandbox_runtime_generation(
                     sandbox_id,
@@ -3384,7 +3383,8 @@ impl KubernetesComputeDriver {
             ));
         }
 
-        let control_connection = sandbox_runtime_control_connection(&object)?;
+        let previous_control_connection = sandbox_runtime_control_connection(&object)?;
+        let control_connection = KubernetesControlConnection::RuntimeInitiated;
         let names = SandboxRuntimeNames::for_generation(sandbox_id, generation.as_str());
         self.create_sandbox_runtime_fence(&namespace, &names)
             .await?;
@@ -3392,6 +3392,48 @@ impl KubernetesComputeDriver {
         stale_generations.push(generation.as_str());
         self.delete_sandbox_runtime_supervisor(sandbox_id, &namespace, &stale_generations)
             .await?;
+        // Both old Pods are gone and the lifecycle gate excludes reconcile.
+        // Upgrade the endpoint in place, preserving its stable ClusterIP. A
+        // retry may find this update completed before the new mode was saved.
+        let services = Api::<Service>::namespaced(self.client.clone(), &namespace);
+        let service = services
+            .get(&names.boundary_service)
+            .await
+            .map_err(KubernetesDriverError::from_kube)?;
+        if !boundary_service_matches_mode(&service, sandbox_id, control_connection) {
+            if !boundary_service_matches_mode(&service, sandbox_id, previous_control_connection) {
+                return Err(KubernetesDriverError::Precondition(format!(
+                    "boundary Service {} no longer matches the recorded control connection",
+                    names.boundary_service
+                )));
+            }
+            let version = service
+                .metadata
+                .resource_version
+                .as_deref()
+                .ok_or_else(|| {
+                    KubernetesDriverError::Message(
+                        "boundary Service has no resourceVersion".to_string(),
+                    )
+                })?;
+            services
+                .patch(
+                    &names.boundary_service,
+                    &PatchParams::default(),
+                    &Patch::Merge(serde_json::json!({
+                        "metadata": {"resourceVersion": version},
+                        "spec": {
+                            "selector": crate::isolation::pair_role_labels(
+                                &crate::sandbox_runtime::pair_label_value(sandbox_id),
+                                crate::isolation::boundary_service_role(control_connection),
+                            ),
+                            "publishNotReadyAddresses": true,
+                        },
+                    })),
+                )
+                .await
+                .map_err(KubernetesDriverError::from_kube)?;
+        }
         let main_process_spec =
             required_sandbox_annotation(&object, ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC)?;
         let log_level = required_sandbox_annotation(&object, ANNOTATION_SANDBOX_RUNTIME_LOG_LEVEL)?;
@@ -3476,6 +3518,7 @@ impl KubernetesComputeDriver {
                         ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_SESSION: launch_authentication.supervisor.session_id.to_string(),
                         ANNOTATION_SANDBOX_RUNTIME_GENERATION: generation.as_str(),
                         ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: supervisor_uid.clone(),
+                        ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION: control_connection.as_str(),
                     });
                     running_patch["spec"]["podTemplate"]["spec"] = restart_pod_template_spec(
                         &volumes,
