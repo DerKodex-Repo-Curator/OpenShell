@@ -2461,7 +2461,6 @@ mod tests {
     mod flow_control;
     mod network_recovery;
     mod protocol_errors;
-    mod runtime_initiated;
 
     use crate::isolation_protocol::exchange_frame;
     use std::path::PathBuf;

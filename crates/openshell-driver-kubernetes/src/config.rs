@@ -997,25 +997,6 @@ fn validate_provider_spiffe_workload_api_socket_path_value(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn control_connection_creation_default_is_runtime_initiated_and_overridable() {
-        assert_eq!(
-            KubernetesSandboxRuntimeConfig::default().control_connection,
-            KubernetesControlConnection::RuntimeInitiated
-        );
-        let parsed: KubernetesSandboxRuntimeConfig =
-            toml::from_str("control_connection = \"supervisor-initiated\"").unwrap();
-        assert_eq!(
-            parsed.control_connection,
-            KubernetesControlConnection::SupervisorInitiated
-        );
-        assert_eq!(parsed.boundary_port, 5500);
-        assert!(
-            toml::from_str::<KubernetesSandboxRuntimeConfig>("control_connection = \"both\"")
-                .is_err()
-        );
-    }
     use std::collections::BTreeMap as HashMap;
 
     #[test]

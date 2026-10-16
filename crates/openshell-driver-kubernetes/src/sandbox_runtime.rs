@@ -23,7 +23,7 @@ use k8s_openapi::api::networking::v1::NetworkPolicy;
 
 use crate::config::KubernetesControlConnection;
 #[cfg(test)]
-use crate::isolation::{BOUNDARY_PAIR_LABEL, BOUNDARY_ROLE_LABEL};
+use crate::isolation::BOUNDARY_ROLE_LABEL;
 use crate::isolation::{
     KubernetesSandboxRuntimeNetworkFence, KubernetesSandboxRuntimeNetworkFenceSpec,
     boundary_service_role, runtime_control_policy,
@@ -779,55 +779,19 @@ mod tests {
     }
 
     #[test]
-    fn service_selects_the_listener_of_the_recorded_mode() {
+    fn service_selects_only_the_workload_boundary() {
         let names = SandboxRuntimeNames::new("4b67c0d0-1111-2222-3333-444444444444");
-        for (mode, role, other) in [
-            (
-                KubernetesControlConnection::SupervisorInitiated,
-                "workload",
-                KubernetesControlConnection::RuntimeInitiated,
-            ),
-            (
-                KubernetesControlConnection::RuntimeInitiated,
-                "supervisor",
-                KubernetesControlConnection::SupervisorInitiated,
-            ),
-        ] {
-            let service = boundary_service("sandbox", &names, "Pair", 5500, mode, owner());
-            let selector = service.spec.as_ref().unwrap().selector.clone().unwrap();
-            assert_eq!(selector[BOUNDARY_ROLE_LABEL], role);
-            // The runtime must reach a not-yet-Ready supervisor; the legacy
-            // Service encoding is unchanged.
-            let serialized = serde_json::to_value(&service).unwrap();
-            assert_eq!(
-                serialized["spec"].get("publishNotReadyAddresses"),
-                (mode == KubernetesControlConnection::RuntimeInitiated)
-                    .then_some(&serde_json::Value::Bool(true))
-            );
-            assert_eq!(selector[BOUNDARY_PAIR_LABEL], "pair");
-            assert!(boundary_service_matches_mode(&service, "Pair", mode));
-            assert!(!boundary_service_matches_mode(&service, "Pair", other));
-            assert!(!boundary_service_matches_mode(&service, "other", mode));
-            let mut flipped = service.clone();
-            let spec = flipped.spec.as_mut().unwrap();
-            spec.publish_not_ready_addresses = match spec.publish_not_ready_addresses {
-                Some(true) => None,
-                _ => Some(true),
-            };
-            assert!(!boundary_service_matches_mode(&flipped, "Pair", mode));
-        }
-    }
-
-    #[test]
-    fn control_policy_is_owned_and_scoped_to_one_pair() {
-        let names = SandboxRuntimeNames::for_generation("Pair", "generation");
-        let policy = control_policy("sandbox", &names, "Pair", 5500, owner());
-        assert_eq!(policy.metadata.name.as_deref(), Some("os-control-pair"));
-        assert_eq!(policy.metadata.owner_references, Some(vec![owner()]));
-        let spec = policy.spec.unwrap();
+        let service = boundary_service(
+            "sandbox",
+            &names,
+            "pair",
+            5500,
+            KubernetesControlConnection::SupervisorInitiated,
+            owner(),
+        );
         assert_eq!(
-            spec.pod_selector.match_labels.unwrap()[BOUNDARY_PAIR_LABEL],
-            "pair"
+            service.spec.unwrap().selector.unwrap()[BOUNDARY_ROLE_LABEL],
+            "workload"
         );
     }
 

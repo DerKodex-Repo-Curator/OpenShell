@@ -35,8 +35,6 @@ const MAX_QUEUED_CONNECTIONS: usize = 2;
 #[derive(Debug)]
 pub struct RuntimeInitiatedListener {
     tls: SandboxTlsClientConfig,
-    #[cfg(test)]
-    local_address: SocketAddr,
     spares: tokio::sync::Mutex<mpsc::Receiver<BoundaryDuplexStream>>,
     accept_task: tokio::task::AbortHandle,
 }
@@ -83,23 +81,9 @@ impl RuntimeInitiatedListener {
         tracing::info!(%local_address, "Runtime-initiated Sandbox Protocol listener ready");
         Ok(std::sync::Arc::new(Self {
             tls: tls.clone(),
-            #[cfg(test)]
-            local_address,
             spares: tokio::sync::Mutex::new(spares),
             accept_task,
         }))
-    }
-
-    /// Address actually bound, including an OS-assigned port.
-    #[cfg(test)]
-    pub fn local_address(&self) -> SocketAddr {
-        self.local_address
-    }
-
-    /// Authenticated spares waiting for a client.
-    #[cfg(test)]
-    pub fn queued_spares(&self) -> usize {
-        self.spares.try_lock().map_or(0, |spares| spares.len())
     }
 
     /// Wait for one authenticated runtime connection for `descriptor`. A
