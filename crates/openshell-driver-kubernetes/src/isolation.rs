@@ -75,8 +75,14 @@ impl KubernetesOuterFenceEvidence<'_> {
                 "Kubernetes provisioning evidence is incomplete".to_string(),
             ));
         }
-        if self.runtime_control_policy.as_ref().is_some_and(|control| !control.is_bound()) {
-            return Err(BackendError::Descriptor("Kubernetes control policy evidence is incomplete".into()));
+        if self
+            .runtime_control_policy
+            .as_ref()
+            .is_some_and(|control| !control.is_bound())
+        {
+            return Err(BackendError::Descriptor(
+                "Kubernetes control policy evidence is incomplete".into(),
+            ));
         }
         let encoded = serde_json::to_vec(self).map_err(|error| {
             BackendError::Descriptor(format!("encode Kubernetes outer fence evidence: {error}"))

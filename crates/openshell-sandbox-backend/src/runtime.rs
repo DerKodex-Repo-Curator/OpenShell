@@ -183,12 +183,7 @@ impl OpenShellRuntimeBackend {
     ) -> Result<(Option<String>, bool), BackendError> {
         let mut client = BoundaryClient::new(descriptor, bearer);
         client.transport = transport;
-        match client.call_idempotent(Request::DiscoverPolicy).await? {
-            Response::ImagePolicy { yaml, invalid } => Ok((yaml, invalid)),
-            _ => Err(BackendError::Descriptor(
-                "expected image policy discovery response".to_string(),
-            )),
-        }
+        client.discover_policy().await
     }
 
     pub fn new(
@@ -1966,7 +1961,8 @@ impl BoundaryClient {
         let transport = Arc::new(TransportAbort::default());
         let connector_transport = transport.clone();
         let authority = match &runtime_descriptor.transport {
-            SandboxTransport::Tcp { authority, .. } => authority.as_str(),
+            SandboxTransport::Tcp { authority, .. }
+            | SandboxTransport::RuntimeInitiatedTcp { authority, .. } => authority.as_str(),
             SandboxTransport::Unix { .. } | SandboxTransport::Vsock { .. } => {
                 "boundary.openshell.internal"
             }
@@ -2610,6 +2606,7 @@ mod tests {
             let result = OpenShellRuntimeBackend::discover_policy(
                 tls_runtime_descriptor(address, client_tls),
                 test_bearer(&"a".repeat(32)),
+                BoundaryTransport::default(),
             )
             .await;
             assert!(
@@ -2652,6 +2649,7 @@ mod tests {
             let result = OpenShellRuntimeBackend::discover_policy(
                 tls_runtime_descriptor(address, client_tls),
                 test_bearer(&"a".repeat(32)),
+                BoundaryTransport::default(),
             )
             .await;
             assert!(
