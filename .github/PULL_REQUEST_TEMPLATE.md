@@ -8,7 +8,7 @@
 <!-- Bullet list of key changes -->
 
 ## Release Notes
-<!-- Optional: concise, user-facing wording for this PR in a release. Leave empty when the summary is enough. -->
+<!-- Optional: describe the user-facing change in a few short, easy-to-read sentences. Keep this section concise. Leave it empty when the summary is enough. -->
 
 ## Testing
 <!-- Report current verification performed for this implementation. Do not copy diagnostics from the original issue. -->

@@ -177,7 +177,7 @@ PR descriptions must follow the project's [PR template](.github/PULL_REQUEST_TEM
 <!-- Bullet list of key changes -->
 
 ## Release Notes
-<!-- Optional: concise, user-facing wording for the release -->
+<!-- Optional: a few short, easy-to-read sentences about the user-facing change -->
 
 ## Testing
 <!-- What testing was done? -->
@@ -191,7 +191,8 @@ PR descriptions must follow the project's [PR template](.github/PULL_REQUEST_TEM
 ```
 
 Populate the testing checklist based on what was actually run. Check boxes for steps that were completed.
-Leave the Release Notes section empty when the summary already captures the user-facing change.
+Keep the Release Notes section concise, with only a few easy-to-read sentences.
+Leave it empty when the summary already captures the user-facing change.
 
 ## Example PR (Complete)
 
