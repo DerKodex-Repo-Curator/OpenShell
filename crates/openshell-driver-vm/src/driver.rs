@@ -44,8 +44,8 @@ use oci_client::manifest::{
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Reference, RegistryOperation};
 use openshell_core::UpstreamProxyConfig;
-use openshell_core::driver_mounts;
 use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
+use openshell_core::driver_mounts;
 use openshell_core::gpu::{
     driver_gpu_requirements, effective_driver_gpu_count, validate_specific_gpu_device_request,
 };
@@ -7465,35 +7465,29 @@ fn overlay_staging_dir(overlay_disk: &Path) -> PathBuf {
     ))
 }
 
-/// How long a host process gets to exit after SIGTERM before it is killed.
+/// Grace after SIGTERM before killing a host process.
 const PROCESS_TERMINATION_GRACE: Duration = Duration::from_secs(5);
 
-/// Seconds the supervisor waits for the workload to exit after SIGTERM before
-/// it kills the workload.
+/// Mirrors the supervisor's workload SIGTERM grace.
 const SUPERVISOR_WORKLOAD_TERM_SECS: u64 = 5;
-/// Seconds the guest waits for the sandbox's remaining processes to exit, then
-/// for the forced kill to be reaped, when it terminates the boundary.
+/// Guest process-tree termination grace plus forced-kill reap time.
 const GUEST_PROCESS_TREE_SECS: u64 = DEFAULT_STOP_TIMEOUT_SECS as u64 + 2;
-/// Seconds the guest allows for flushing its filesystem.
+/// Mirrors the guest's filesystem flush timeout.
 const GUEST_FLUSH_SECS: u64 = 3;
+/// Allow control round trips and scheduling between shutdown stages.
+const SHUTDOWN_SCHEDULING_SECS: u64 = 2;
 
-/// How long the host supervisor gets to finish its orderly shutdown after
-/// SIGTERM: the workload's termination wait, then the guest's process-tree
-/// termination and filesystem flush. The values mirror those bounds, so a
-/// healthy stop, even a slow one, finishes inside it. A supervisor still
-/// running after this is stuck on an unresponsive guest and is killed.
-///
-/// The workload wait, the flush bound and the caller deadline below are copies
-/// of values defined in other crates; only the stop timeout is shared. Nothing
-/// fails to compile if one of those changes, so the assertion below checks the
-/// copies, not the originals. The grace is also the exact sum of the stage
-/// maxima with no slack: a stop in which every stage runs to its limit can
-/// kill the supervisor just before it acknowledges.
-const SUPERVISOR_SHUTDOWN_GRACE: Duration =
-    Duration::from_secs(SUPERVISOR_WORKLOAD_TERM_SECS + GUEST_PROCESS_TREE_SECS + GUEST_FLUSH_SECS);
+/// Budget for workload termination, guest process cleanup and filesystem flush.
+/// The cap may interrupt slow shutdown or log draining. Only the stop timeout
+/// is shared; changes to the other stage limits must be reflected here.
+const SUPERVISOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(
+    SUPERVISOR_WORKLOAD_TERM_SECS
+        + GUEST_PROCESS_TREE_SECS
+        + GUEST_FLUSH_SECS
+        + SHUTDOWN_SCHEDULING_SECS,
+);
 
-/// The gateway cancels a stop that runs longer than this when it reclaims an
-/// expired provisioning attempt, which would skip the stop's cleanup steps.
+/// Mirrors the gateway's stop deadline when reclaiming expired provisioning.
 const STOP_CALLER_DEADLINE: Duration = Duration::from_secs(30);
 
 // The longest stop is the supervisor's grace plus the VM's.
@@ -7531,11 +7525,8 @@ async fn terminate_vm_process_within(
 
 /// Stop the host supervisor first, then the VM it was supervising.
 ///
-/// The supervisor exits immediately when the parent-liveness pipe reaches EOF,
-/// treating it as driver death. The pipe therefore stays open until the
-/// supervisor has exited, so SIGTERM runs its orderly shutdown (terminate the
-/// workload, then have the guest terminate and flush its filesystem) instead
-/// of losing a race with the pipe closing.
+/// Keep liveness open until the supervisor exits: EOF skips orderly workload
+/// teardown, the guest filesystem flush and the supervisor's log export drain.
 async fn terminate_sandbox_processes(process: &mut VmProcess) -> Result<(), std::io::Error> {
     terminate_sandbox_processes_within(process, SUPERVISOR_SHUTDOWN_GRACE).await
 }
@@ -12078,63 +12069,7 @@ mod tests {
             .unwrap()
     }
 
-    /// A stand-in supervisor that drains for a second on SIGTERM and then
-    /// writes `marker`, unless liveness reached EOF while it drained, which
-    /// would have made the real supervisor exit at once.
-    #[cfg(unix)]
-    fn spawn_draining_supervisor(marker: &Path) -> (Child, fs::File) {
-        let (liveness_read, liveness_write) = nix::unistd::pipe().unwrap();
-        // As in production, so the child does not inherit the write end.
-        nix::fcntl::fcntl(
-            liveness_write.as_raw_fd(),
-            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
-        )
-        .unwrap();
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg(
-                r#"(cat >/dev/null; touch "$0.eof") <&0 &
-trap 'sleep 1; [ -e "$0.eof" ] || echo drained > "$0"; exit 0' TERM
-wait $!
-exit 1"#,
-            )
-            .arg(marker)
-            .stdin(Stdio::from(liveness_read))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        // Let the shell install its trap before the test signals it.
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(child.try_wait().unwrap().is_none());
-        (child, fs::File::from(liveness_write))
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn stopping_a_sandbox_lets_the_supervisor_drain_before_closing_liveness() {
-        let dir = unique_temp_dir();
-        fs::create_dir_all(&dir).unwrap();
-        let marker = dir.join("drained");
-        let (supervisor, liveness) = spawn_draining_supervisor(&marker);
-        let mut process = VmProcess {
-            child: spawn_exited_child(),
-            supervisor,
-            supervisor_liveness: Some(liveness),
-            deleting: true,
-        };
-
-        terminate_sandbox_processes(&mut process).await.unwrap();
-
-        assert_eq!(fs::read_to_string(&marker).unwrap(), "drained\n");
-        assert!(process.supervisor_liveness.is_none());
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    /// The supervisor exits at once when its parent-liveness pipe reaches EOF,
-    /// so a stop must signal it while the pipe is still open. The stand-in
-    /// supervisor takes 200 ms to handle SIGTERM, long enough for a prematurely
-    /// closed pipe to be seen first.
+    /// Delay SIGTERM handling so premature liveness EOF wins the race.
     #[tokio::test]
     async fn stop_signals_supervisor_before_closing_its_liveness_pipe() {
         let dir = unique_temp_dir();

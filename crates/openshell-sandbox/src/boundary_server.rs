@@ -90,11 +90,8 @@ mod linux {
     const ENFORCEMENT_LOSS_TERMINATION_GRACE: Duration =
         Duration::from_secs(openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS as u64);
     const FORCE_KILL_REAP_TIMEOUT: Duration = Duration::from_secs(2);
-    /// Longest the boundary waits for the sandbox filesystem flush before it
-    /// acknowledges termination anyway. It stays well inside the host's
-    /// request timeout so a slow flush cannot turn into a missed
-    /// acknowledgement. A timed-out flush's blocking thread cannot be
-    /// cancelled and may outlive the acknowledgement.
+    /// Bound the wait for a flush before acknowledging termination. A timed-out
+    /// blocking task cannot be cancelled and may outlive the acknowledgement.
     const FILESYSTEM_FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
     const MAX_PENDING_HANDSHAKES: usize = 32;
     const MAX_CONTROL_CONNECTIONS: usize = 128;
@@ -1435,22 +1432,15 @@ mod linux {
     /// Writes the sandbox's writable filesystem to its backing store.
     type FlushFn = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
 
-    /// How the boundary flushes the sandbox filesystem when it terminates, and
-    /// how long it waits for that flush.
+    /// Filesystem flush operation and its termination wait bound.
     struct FilesystemFlush {
         run: FlushFn,
         timeout: Duration,
     }
 
     impl FilesystemFlush {
-        /// The flush for a boundary listening on `listener`, or `None` when the
-        /// boundary must not flush.
-        ///
-        /// Only the VM backend (a vsock listener) needs it: a VM's page cache is
-        /// lost when the host ends the VM. A container's page cache lives in the
-        /// host kernel and survives the container, while `syncfs` on its overlay
-        /// root would write back the whole host filesystem that holds the upper
-        /// directory. Any other or future listener therefore gets no flush.
+        /// VM page caches disappear at shutdown. Container page caches survive
+        /// in the host, where `syncfs` would flush the shared backing filesystem.
         fn for_listener(listener: &BoundaryListenerConfig) -> Option<Self> {
             match listener {
                 BoundaryListenerConfig::Vsock { .. } => Some(Self {
@@ -1485,8 +1475,7 @@ mod linux {
         process_runtime: tokio::runtime::Handle,
         state: Mutex<RuntimeState>,
         supervisor_connection: Mutex<SupervisorConnectionState>,
-        /// Flushes the sandbox filesystem during termination; `None` for
-        /// backends that must not flush.
+        /// VM-only termination flush.
         filesystem_flush: Option<FilesystemFlush>,
         next_recovery_id: AtomicU64,
         /// The wire policy bound at first attach, so an idempotent attach retry
@@ -2087,12 +2076,8 @@ mod linux {
                 Some(process) => Self::terminate_process_tree(&process, false).await,
                 None => Ok(()),
             };
-            // The acknowledgement tells the host that the sandbox is finished, and
-            // the host may end the VM as soon as it has it. Flush first so writes
-            // the workload completed are on the backing store before then; guest
-            // kernels hold dirty pages for tens of seconds. Termination failure
-            // does not skip the flush, because other workload writes are still
-            // dirty.
+            // The host may end the VM on acknowledgement. Flush dirty writes
+            // first, even if process termination failed.
             self.flush_filesystem().await;
             if let Err(error) = terminated {
                 return guest_error(BoundaryErrorKind::Process, error);
@@ -2101,9 +2086,7 @@ mod linux {
             Response::BoundaryTerminated
         }
 
-        /// Flush the sandbox filesystem within the configured bound. A failed or
-        /// slow flush is logged and does not stop termination: the host's own
-        /// stop path still ends the VM, which is no worse than not flushing.
+        /// Log flush failures and timeouts while allowing termination to finish.
         async fn flush_filesystem(&self) {
             let Some(filesystem_flush) = &self.filesystem_flush else {
                 return;
@@ -4420,12 +4403,7 @@ mod linux {
         }
 
         fn availability_test_runtime() -> (Arc<BoundaryRuntime>, String) {
-            // Existing tests do not exercise the flush, and a real `syncfs` of the
-            // test host's root filesystem would be slow and unrelated.
-            availability_test_runtime_with_flush(FilesystemFlush {
-                run: Arc::new(|| Ok(())),
-                timeout: FILESYSTEM_FLUSH_TIMEOUT,
-            })
+            availability_test_runtime_with(None)
         }
 
         fn availability_test_runtime_with_flush(
@@ -4675,9 +4653,7 @@ mod linux {
                 let saw_terminating = Arc::clone(&saw_terminating);
                 FilesystemFlush {
                     run: Arc::new(move || {
-                        // The host may end the VM as soon as it sees the terminal
-                        // acknowledgement, so the flush must run while the boundary
-                        // is still terminating and before it turns terminal.
+                        // Flush before the terminal transition permits VM teardown.
                         if let Some(runtime) = runtime_cell.get().and_then(std::sync::Weak::upgrade)
                         {
                             saw_terminating.store(
@@ -4764,11 +4740,8 @@ mod linux {
             );
         }
 
-        /// A unit test cannot observe that dirty pages reached disk, so the
-        /// strongest direct checks are that the real flush opens the target and
-        /// reports a failure to open it. Persistence is covered by the VM stop
-        /// and restart trials. Replacing the flush with a no-op fails the error
-        /// case.
+        /// Exercise the real syscall and open-error path; persistence requires
+        /// VM stop/start testing.
         #[test]
         fn real_filesystem_flush_syncs_an_existing_path_and_reports_a_missing_one() {
             let directory = tempfile::tempdir().expect("temporary directory");
