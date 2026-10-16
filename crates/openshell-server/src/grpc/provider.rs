@@ -1033,6 +1033,32 @@ pub(super) async fn resolve_provider_environment_with_credentials(
     .await
 }
 
+/// Loads one provider; `Ok(None)` means it does not exist.
+pub(super) async fn load_provider_environment_record(
+    store: &Store,
+    workspace: &str,
+    name: &str,
+) -> Result<Option<ProviderEnvironmentRecord>, Status> {
+    let Some(record) = store
+        .get_by_name(Provider::object_type(), workspace, name)
+        .await
+        .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
+    else {
+        return Ok(None);
+    };
+    let provider = Provider::decode(record.payload.as_slice())
+        .map_err(|e| Status::internal(format!("failed to decode provider '{name}': {e}")))?;
+    let refresh_states =
+        crate::provider_refresh::list_refresh_states_for_provider(store, &record.id).await?;
+    Ok(Some(ProviderEnvironmentRecord {
+        name: name.to_string(),
+        object_id: record.id,
+        resource_version: record.resource_version,
+        provider,
+        refresh_states,
+    }))
+}
+
 pub(super) async fn load_provider_environment_records(
     store: &Store,
     workspace: &str,
@@ -1040,22 +1066,10 @@ pub(super) async fn load_provider_environment_records(
 ) -> Result<Vec<ProviderEnvironmentRecord>, Status> {
     let mut records = Vec::with_capacity(provider_names.len());
     for name in provider_names {
-        let record = store
-            .get_by_name(Provider::object_type(), workspace, name)
-            .await
-            .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
+        let record = load_provider_environment_record(store, workspace, name)
+            .await?
             .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
-        let provider = Provider::decode(record.payload.as_slice())
-            .map_err(|e| Status::internal(format!("failed to decode provider '{name}': {e}")))?;
-        let refresh_states =
-            crate::provider_refresh::list_refresh_states_for_provider(store, &record.id).await?;
-        records.push(ProviderEnvironmentRecord {
-            name: name.clone(),
-            object_id: record.id,
-            resource_version: record.resource_version,
-            provider,
-            refresh_states,
-        });
+        records.push(record);
     }
     Ok(records)
 }
