@@ -90,6 +90,8 @@ pub async fn start_boundary_access(
     port_forward: Arc<BoundaryLoopbackConnector>,
     agent: Arc<BoundaryProcess>,
     supervisor_session_updates: Option<tokio::sync::watch::Sender<Option<String>>>,
+    config_apply_tx: tokio::sync::mpsc::Sender<crate::supervisor_session::ConfigApplyRequest>,
+    config_push_updates: tokio::sync::watch::Sender<bool>,
     host_key: Option<russh::keys::PrivateKey>,
 ) -> Result<BoundaryAccess> {
     let instance_id = uuid::Uuid::new_v4().to_string();
@@ -126,6 +128,8 @@ pub async fn start_boundary_access(
                 crate::supervisor_session::SessionRuntimeContext {
                     instance_id: instance_id.clone(),
                     session_id_updates: supervisor_session_updates,
+                    config_apply_tx,
+                    config_push_updates,
                 },
             );
             (Some(task), Some(accepted))
@@ -358,6 +362,8 @@ mod tests {
             rpc_test::loopback(boundary.clone()),
             rpc_test::process(boundary),
             None,
+            tokio::sync::mpsc::channel(1).0,
+            tokio::sync::watch::channel(false).0,
             None,
         )
         .await
@@ -397,6 +403,8 @@ mod tests {
             rpc_test::loopback(boundary.clone()),
             rpc_test::process(boundary),
             None,
+            tokio::sync::mpsc::channel(1).0,
+            tokio::sync::watch::channel(false).0,
             None,
         )
         .await;

@@ -1024,13 +1024,7 @@ pub(super) async fn resolve_provider_environment_with_credentials(
     credentials: &crate::credentials::CredentialRuntime,
 ) -> Result<ProviderEnvironment, Status> {
     let records = load_provider_environment_records(store, workspace, provider_names).await?;
-    resolve_provider_environment_from_records_with_credentials(
-        store,
-        catalog,
-        &records,
-        credentials,
-    )
-    .await
+    resolve_provider_environment_from_records_with_credentials(catalog, &records, credentials).await
 }
 
 /// Loads one provider; `Ok(None)` means it does not exist.
@@ -1064,19 +1058,17 @@ pub(super) async fn load_provider_environment_records(
     workspace: &str,
     provider_names: &[String],
 ) -> Result<Vec<ProviderEnvironmentRecord>, Status> {
-    let mut records = Vec::with_capacity(provider_names.len());
-    for name in provider_names {
-        let record = load_provider_environment_record(store, workspace, name)
+    // Providers are independent, so load them concurrently.
+    futures::future::try_join_all(provider_names.iter().map(|name| async move {
+        load_provider_environment_record(store, workspace, name)
             .await?
-            .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
-        records.push(record);
-    }
-    Ok(records)
+            .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))
+    }))
+    .await
 }
 
 #[cfg(test)]
 pub(super) async fn resolve_provider_environment_from_records(
-    store: &Store,
     catalog: &EffectiveProviderProfileCatalog,
     records: &[ProviderEnvironmentRecord],
 ) -> Result<ProviderEnvironment, Status> {
@@ -1085,7 +1077,6 @@ pub(super) async fn resolve_provider_environment_from_records(
     )
     .map_err(|err| Status::internal(format!("initialize credential runtime failed: {err}")))?;
     resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-        store,
         catalog,
         records,
         &HashMap::new(),
@@ -1097,13 +1088,11 @@ pub(super) async fn resolve_provider_environment_from_records(
 
 #[cfg(test)]
 pub(super) async fn resolve_provider_environment_from_records_with_credentials(
-    store: &Store,
     catalog: &EffectiveProviderProfileCatalog,
     records: &[ProviderEnvironmentRecord],
     credentials: &crate::credentials::CredentialRuntime,
 ) -> Result<ProviderEnvironment, Status> {
     resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-        store,
         catalog,
         records,
         &HashMap::new(),
@@ -1115,7 +1104,6 @@ pub(super) async fn resolve_provider_environment_from_records_with_credentials(
 
 #[cfg(test)]
 pub(super) async fn resolve_provider_environment_from_records_with_policy_bindings(
-    store: &Store,
     catalog: &EffectiveProviderProfileCatalog,
     records: &[ProviderEnvironmentRecord],
     policy_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
@@ -1125,7 +1113,6 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
     )
     .map_err(|err| Status::internal(format!("initialize credential runtime failed: {err}")))?;
     resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-        store,
         catalog,
         records,
         policy_bindings,
@@ -1136,7 +1123,6 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
 }
 
 pub(super) async fn resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-    store: &Store,
     catalog: &EffectiveProviderProfileCatalog,
     records: &[ProviderEnvironmentRecord],
     policy_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
@@ -1157,7 +1143,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
     let mut readiness_reason = openshell_core::proto::ProviderReadinessReason::Unspecified;
     let mut expired_static_keys = HashSet::new();
     let now_ms = crate::persistence::current_time_ms();
-    validate_provider_environment_records_unique_at(store, catalog, records, now_ms).await?;
+    validate_provider_environment_records_unique_at(catalog, records, now_ms)?;
     let registry = openshell_providers::ProviderRegistry::new();
 
     for record in records {
@@ -2093,8 +2079,7 @@ async fn validate_provider_environment_keys_unique_at(
     Ok(())
 }
 
-async fn validate_provider_environment_records_unique_at(
-    store: &Store,
+fn validate_provider_environment_records_unique_at(
     catalog: &EffectiveProviderProfileCatalog,
     records: &[ProviderEnvironmentRecord],
     now_ms: i64,
@@ -2108,14 +2093,7 @@ async fn validate_provider_environment_records_unique_at(
             &mut seen_credentials,
             &mut seen_plugin_config,
             &record.name,
-            active_provider_environment_keys_for_identity(
-                store,
-                catalog,
-                provider,
-                &record.object_id,
-                now_ms,
-            )
-            .await?,
+            active_keys_with_refresh_states(catalog, provider, &record.refresh_states, now_ms),
             provider_plugin_environment_keys(catalog, provider),
         )?;
         dynamic_bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
@@ -2390,27 +2368,41 @@ async fn active_provider_environment_keys_for_identity(
     provider_identity: &str,
     now_ms: i64,
 ) -> Result<Vec<String>, Status> {
+    let refresh_states = if provider_identity.is_empty() {
+        Vec::new()
+    } else {
+        crate::provider_refresh::list_refresh_states_for_provider(store, provider_identity).await?
+    };
+    Ok(active_keys_with_refresh_states(
+        catalog,
+        provider,
+        &refresh_states,
+        now_ms,
+    ))
+}
+
+fn active_keys_with_refresh_states(
+    catalog: &EffectiveProviderProfileCatalog,
+    provider: &Provider,
+    refresh_states: &[StoredProviderCredentialRefreshState],
+    now_ms: i64,
+) -> Vec<String> {
     let broker_only_credential_keys =
         broker_only_provider_credential_keys_for_provider(catalog, provider);
     let mut keys = active_provider_credential_keys(provider, now_ms, &broker_only_credential_keys);
-    if !provider_identity.is_empty() {
-        for state in
-            crate::provider_refresh::list_refresh_states_for_provider(store, provider_identity)
-                .await?
-        {
-            // The primary key plus every co-minted output key this refresh owns,
-            // so a configured-but-not-yet-minted refresh reserves all of them.
-            keys.extend(
-                std::iter::once(state.credential_key)
-                    .chain(state.additional_output_keys.into_values())
-                    .filter(|key| !broker_only_credential_keys.contains(key))
-                    .filter(|key| is_valid_env_key(key)),
-            );
-        }
+    for state in refresh_states {
+        // The primary key plus every co-minted output key this refresh owns,
+        // so a configured-but-not-yet-minted refresh reserves all of them.
+        keys.extend(
+            std::iter::once(state.credential_key.clone())
+                .chain(state.additional_output_keys.values().cloned())
+                .filter(|key| !broker_only_credential_keys.contains(key))
+                .filter(|key| is_valid_env_key(key)),
+        );
     }
     keys.sort();
     keys.dedup();
-    Ok(keys)
+    keys
 }
 
 fn active_provider_credential_keys(
@@ -2643,6 +2635,20 @@ async fn authorize_and_resolve_profile_workspace(
     }
 }
 
+/// Publish a provider record change to the sandboxes that attach it.
+fn publish_provider_change(state: &Arc<ServerState>, workspace: &str, provider_name: &str) {
+    crate::config_delivery::publish_provider(state, workspace, provider_name);
+}
+
+/// A profile change affects every provider of its type in scope.
+fn publish_provider_profile_change(state: &Arc<ServerState>, workspace: &str) {
+    if workspace.is_empty() {
+        crate::config_delivery::publish_all_connected(state);
+    } else {
+        crate::config_delivery::publish_workspace(state, workspace);
+    }
+}
+
 fn selected_profile_workspace(
     workspace_scope: Option<&openshell_core::proto::WorkspaceSelector>,
 ) -> Result<&str, Status> {
@@ -2716,6 +2722,7 @@ pub(super) async fn handle_create_provider(
                 LifecycleOperation::Create,
                 TelemetryOutcome::Success,
             );
+            publish_provider_change(state, &workspace, provider.object_name());
             Ok(Response::new(ProviderResponse {
                 provider: Some(provider),
                 ..Default::default()
@@ -2993,6 +3000,7 @@ pub(super) async fn handle_import_provider_profiles(
             stored.profile.unwrap_or_default(),
             resource_version,
         ));
+        publish_provider_profile_change(state, &workspace);
     }
 
     Ok(Response::new(ImportProviderProfilesResponse {
@@ -3129,6 +3137,7 @@ pub(super) async fn handle_update_provider_profiles(
     replay_facts.resource(&stored)?;
     let resource_version = stored_profile_resource_version(&stored);
     let profile = profile_response_payload(stored.profile.unwrap_or_default(), resource_version);
+    publish_provider_profile_change(state, &workspace);
 
     Ok(Response::new(UpdateProviderProfilesResponse {
         diagnostics: Vec::new(),
@@ -3225,6 +3234,7 @@ pub(super) async fn handle_delete_provider_profile(
         .delete(StoredProviderProfile::object_type(), existing.object_id())
         .await
         .map_err(|e| Status::internal(format!("delete provider profile failed: {e}")))?;
+    publish_provider_profile_change(state, &workspace);
 
     Ok(Response::new(DeleteProviderProfileResponse {
         outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
@@ -4082,6 +4092,7 @@ pub(super) async fn handle_update_provider(
                 LifecycleOperation::Update,
                 TelemetryOutcome::Success,
             );
+            publish_provider_change(state, &workspace, provider.object_name());
             Ok(Response::new(ProviderResponse {
                 provider: Some(provider),
                 target_receipts,
@@ -5164,8 +5175,17 @@ pub(super) async fn handle_configure_provider_refresh(
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         };
-        update_provider_record_with_catalog(state.store.as_ref(), &catalog, &workspace, updated)
-            .await?;
+        let result = update_provider_record_with_catalog(
+            state.store.as_ref(),
+            &catalog,
+            &workspace,
+            updated,
+        )
+        .await;
+        publish_provider_change(state, &workspace, provider_name);
+        result?;
+    } else {
+        publish_provider_change(state, &workspace, provider_name);
     }
 
     replay_facts.refresh(&state_record)?;
@@ -5211,6 +5231,7 @@ pub(super) async fn handle_rotate_provider_credential(
         credential_key,
     )
     .await?;
+    publish_provider_change(state, &workspace, provider_name);
 
     replay_facts.refresh(&refresh_state)?;
     Ok(Response::new(RotateProviderCredentialResponse {
@@ -5299,7 +5320,6 @@ pub(super) async fn handle_delete_provider_refresh(
         refresh_state.clone(),
     )
     .await?;
-
     // A refresh co-manages the expiry of its primary credential and every pinned
     // additional output. Clear each expiry this refresh still owns, leaving
     // independently updated ones in place. The equality check and removal run
@@ -5321,8 +5341,10 @@ pub(super) async fn handle_delete_provider_refresh(
                 Status::internal(format!(
                     "clear refresh-owned credential expiries failed: {e}"
                 ))
-            })?;
+            })
+            .map(|_| ())?;
     }
+    publish_provider_change(state, &workspace, provider_name);
 
     Ok(Response::new(DeleteProviderRefreshResponse {
         outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
@@ -5376,6 +5398,9 @@ pub(super) async fn handle_delete_provider(
                 LifecycleOperation::Delete,
                 outcome,
             );
+            if deleted {
+                publish_provider_change(state, &workspace, &name);
+            }
             Ok(Response::new(DeleteProviderResponse {
                 outcome: super::deletion_outcome(deleted, req.allow_missing, "provider")?,
             }))
@@ -6064,13 +6089,13 @@ mod tests {
         let mut records = load_provider_environment_records(store, "default", &["provider".into()])
             .await
             .unwrap();
-        let valid = resolve_provider_environment_from_records(store, &catalog, &records)
+        let valid = resolve_provider_environment_from_records(&catalog, &records)
             .await
             .expect("valid dynamic environment");
         assert_eq!(valid.dynamic_credentials.len(), 1);
         for malformed_name in ["provider\tother", "provider\n", "provider:other"] {
             records[0].name = malformed_name.into();
-            let error = resolve_provider_environment_from_records(store, &catalog, &records)
+            let error = resolve_provider_environment_from_records(&catalog, &records)
                 .await
                 .expect_err("invalid record key must reject the whole environment");
             assert_eq!(error.code(), Code::FailedPrecondition);
@@ -12324,7 +12349,6 @@ mod tests {
         .await
         .unwrap();
         let first = resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-            state.store.as_ref(),
             &catalog,
             &records,
             &HashMap::new(),
@@ -12392,7 +12416,6 @@ mod tests {
                 .unwrap();
         let unchanged_environment =
             resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-                state.store.as_ref(),
                 &catalog,
                 &unchanged_records,
                 &HashMap::new(),
@@ -12444,7 +12467,6 @@ mod tests {
         .unwrap();
         let second =
             resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-                state.store.as_ref(),
                 &catalog,
                 &records,
                 &HashMap::new(),
@@ -12508,7 +12530,6 @@ mod tests {
             .await
             .unwrap();
         let third = resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-            state.store.as_ref(),
             &catalog,
             &records,
             &HashMap::new(),
@@ -12698,7 +12719,6 @@ mod tests {
 
         let result =
             resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-                &store,
                 &catalog,
                 &records,
                 &HashMap::new(),
@@ -12798,7 +12818,6 @@ mod tests {
         )]);
 
         let result = resolve_provider_environment_from_records_with_policy_bindings(
-            &store,
             &catalog,
             &records,
             &policy_bindings,
@@ -12868,7 +12887,6 @@ mod tests {
         .expect("test credential runtime");
         let result =
             resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-                &store,
                 &catalog,
                 &records,
                 &policy_bindings,
@@ -12945,7 +12963,6 @@ mod tests {
 
         let unbound =
             resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-                &store,
                 &catalog,
                 &records,
                 &HashMap::new(),
@@ -12970,7 +12987,6 @@ mod tests {
             }],
         )]);
         let bound = resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-            &store,
             &catalog,
             &records,
             &policy_bindings,

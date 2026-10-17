@@ -1015,6 +1015,20 @@ the sandbox over per-sandbox TLS with server-certificate verification plus
 bootstrap-token client authentication, and owns gateway policy, provider
 credentials, DNS, and mediated upstream connections.
 
+The supervisor loads its startup configuration through the polling RPCs and
+opens `ConnectSupervisor` once the workload runs. When the gateway runs with
+`config_delivery_mode = "push"`, it accepts the session with
+`config_push_enabled` and a bootstrap update. The supervisor applies the
+bootstrap, stops polling, and receives later updates on that stream. Every
+update must contain both the sandbox configuration and the provider
+environment it names. A reconnect to a gateway in poll mode resumes polling.
+
+If live policy or provider changes do not reach a sandbox in push mode, inspect
+gateway and supervisor logs for bootstrap build failures, updates missing a
+configuration part, apply failures, or the two-minute bootstrap timeout. Do not
+add gateway credentials to the workload Pod; configuration delivery terminates
+in the separate supervisor.
+
 Inspect all driver-managed resources when a Kubernetes sandbox remains Starting
 or loses readiness:
 

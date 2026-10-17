@@ -56,7 +56,7 @@ bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
 
 [dev-dependencies]
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
-
+tonic-prost = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 futures = { workspace = true }
 temp-env = "0.3"
