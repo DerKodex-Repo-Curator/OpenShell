@@ -105,7 +105,9 @@ impl BoundaryTransport {
     /// supervisor's Tokio runtime.
     pub fn for_descriptor(descriptor: &SandboxRuntimeDescriptor) -> Result<Self, BackendError> {
         Ok(Self(match descriptor.transport {
-            SandboxTransport::RuntimeInitiatedTcp { .. } => TransportSource::RuntimeInitiated(
+            SandboxTransport::RuntimeInitiatedTcp { .. }
+            | SandboxTransport::RuntimeInitiatedUnix { .. }
+            | SandboxTransport::RuntimeInitiatedVsock { .. } => TransportSource::RuntimeInitiated(
                 crate::runtime_initiated::RuntimeInitiatedListener::bind(descriptor)?,
             ),
             _ => TransportSource::Dial,
@@ -1963,9 +1965,10 @@ impl BoundaryClient {
         let authority = match &runtime_descriptor.transport {
             SandboxTransport::Tcp { authority, .. }
             | SandboxTransport::RuntimeInitiatedTcp { authority, .. } => authority.as_str(),
-            SandboxTransport::Unix { .. } | SandboxTransport::Vsock { .. } => {
-                "boundary.openshell.internal"
-            }
+            SandboxTransport::Unix { .. }
+            | SandboxTransport::Vsock { .. }
+            | SandboxTransport::RuntimeInitiatedUnix { .. }
+            | SandboxTransport::RuntimeInitiatedVsock { .. } => "boundary.openshell.internal",
         };
         let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{authority}"))
             .map_err(|error| {
@@ -2129,7 +2132,9 @@ async fn connect_boundary_using_connector(
                 Box::new(stream)
             }
             SandboxTransport::Vsock { guest_cid, port } => connect_host_vsock(*guest_cid, *port)?,
-            SandboxTransport::RuntimeInitiatedTcp { .. } => {
+            SandboxTransport::RuntimeInitiatedTcp { .. }
+            | SandboxTransport::RuntimeInitiatedUnix { .. }
+            | SandboxTransport::RuntimeInitiatedVsock { .. } => {
                 return Err(BackendError::Descriptor(
                     "a runtime-initiated transport cannot be dialed".to_string(),
                 ));

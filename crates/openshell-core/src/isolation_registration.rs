@@ -35,12 +35,21 @@ pub enum SandboxTransport {
         authority: String,
         listen_address: SocketAddr,
     },
+    RuntimeInitiatedUnix {
+        socket_path: PathBuf,
+    },
+    RuntimeInitiatedVsock {
+        guest_cid: u32,
+        port: u32,
+    },
 }
 
 impl SandboxTransport {
     pub fn validate(&self) -> Result<(), &'static str> {
         let valid = match self {
-            Self::Unix { socket_path } => socket_path.is_absolute(),
+            Self::Unix { socket_path } | Self::RuntimeInitiatedUnix { socket_path } => {
+                socket_path.is_absolute()
+            }
             Self::Tcp {
                 authority,
                 addresses,
@@ -55,7 +64,7 @@ impl SandboxTransport {
                 authority,
                 listen_address,
             } => !authority.is_empty() && listen_address.port() != 0,
-            Self::Vsock { guest_cid, port } => {
+            Self::Vsock { guest_cid, port } | Self::RuntimeInitiatedVsock { guest_cid, port } => {
                 *guest_cid >= 3 && *guest_cid != u32::MAX && *port != 0 && *port != u32::MAX
             }
         };
@@ -95,6 +104,8 @@ pub fn validate_registrations(registrations: &[BackendRegistration]) -> Result<(
         if matches!(
             registration.endpoint,
             SandboxTransport::RuntimeInitiatedTcp { .. }
+                | SandboxTransport::RuntimeInitiatedUnix { .. }
+                | SandboxTransport::RuntimeInitiatedVsock { .. }
         ) {
             return Err("runtime-initiated control is not a registered backend endpoint");
         }
@@ -117,7 +128,9 @@ impl TryFrom<&BackendRegistration> for crate::proto::compute::v1::IsolationBacke
         validate_backend_name(&registration.name)?;
         registration.endpoint.validate()?;
         let endpoint = match &registration.endpoint {
-            SandboxTransport::RuntimeInitiatedTcp { .. } => {
+            SandboxTransport::RuntimeInitiatedTcp { .. }
+            | SandboxTransport::RuntimeInitiatedUnix { .. }
+            | SandboxTransport::RuntimeInitiatedVsock { .. } => {
                 return Err("runtime-initiated control is not a registered backend endpoint");
             }
             SandboxTransport::Unix { socket_path } => Endpoint::UnixSocketPath(

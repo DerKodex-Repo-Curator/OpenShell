@@ -363,6 +363,16 @@ pub enum BoundaryListener {
         addresses: Vec<std::net::SocketAddr>,
         tls: SandboxTlsServerConfig,
     },
+    /// Dial the supervisor over the driver's protected shared Unix socket.
+    RuntimeInitiatedUnix {
+        socket_path: PathBuf,
+        tls: SandboxTlsServerConfig,
+    },
+    /// Dial the host supervisor through the VM's vsock device.
+    RuntimeInitiatedVsock {
+        host_port: u32,
+        tls: SandboxTlsServerConfig,
+    },
 }
 
 /// Public verification key staged in the sandbox's immutable auth bundle.

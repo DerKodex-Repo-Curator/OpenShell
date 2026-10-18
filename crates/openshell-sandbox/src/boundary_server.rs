@@ -252,7 +252,10 @@ mod linux {
             BoundaryListenerConfig::RuntimeInitiatedTlsTcp { addresses, .. } => {
                 addresses.first().map(std::net::SocketAddr::port)
             }
-            BoundaryListenerConfig::Unix { .. } | BoundaryListenerConfig::Vsock { .. } => None,
+            BoundaryListenerConfig::Unix { .. }
+            | BoundaryListenerConfig::Vsock { .. }
+            | BoundaryListenerConfig::RuntimeInitiatedUnix { .. }
+            | BoundaryListenerConfig::RuntimeInitiatedVsock { .. } => None,
         };
         let network_broker = NetworkBroker::start(listener, protected_control_port)
             .map_err(|error| format!("start sandbox network broker: {error}"))?;
@@ -339,6 +342,7 @@ mod linux {
         }
         match &config.listener {
             BoundaryListenerConfig::Unix { socket_path, tls }
+            | BoundaryListenerConfig::RuntimeInitiatedUnix { socket_path, tls }
                 if !socket_path.is_absolute() || !tls_paths_are_absolute(tls) =>
             {
                 return Err("boundary Unix socket path must be absolute".to_string());
@@ -366,12 +370,19 @@ mod linux {
             } => {
                 return Err("boundary control port must be nonzero".to_string());
             }
+            BoundaryListenerConfig::RuntimeInitiatedVsock { host_port, tls }
+                if *host_port == 0 || *host_port == u32::MAX || !tls_paths_are_absolute(tls) =>
+            {
+                return Err("runtime-initiated vsock requires a valid host port and absolute certificate paths".into());
+            }
             BoundaryListenerConfig::RuntimeInitiatedTlsTcp {
                 authority,
                 addresses,
                 tls,
             } => validate_runtime_initiated_targets(authority, addresses, tls)?,
             BoundaryListenerConfig::Unix { .. }
+            | BoundaryListenerConfig::RuntimeInitiatedUnix { .. }
+            | BoundaryListenerConfig::RuntimeInitiatedVsock { .. }
             | BoundaryListenerConfig::TlsTcp { .. }
             | BoundaryListenerConfig::Vsock { .. } => {}
         }
@@ -563,8 +574,14 @@ mod linux {
     }
 
     fn serve(config: &BoundaryListenerConfig, runtime: Arc<BoundaryRuntime>) -> Result<(), String> {
-        if let BoundaryListenerConfig::RuntimeInitiatedTlsTcp { addresses, tls, .. } = config {
-            return serve_runtime_initiated(config, addresses.clone(), tls, runtime);
+        let dial_tls = match config {
+            BoundaryListenerConfig::RuntimeInitiatedTlsTcp { tls, .. }
+            | BoundaryListenerConfig::RuntimeInitiatedUnix { tls, .. }
+            | BoundaryListenerConfig::RuntimeInitiatedVsock { tls, .. } => Some(tls),
+            _ => None,
+        };
+        if let Some(tls) = dial_tls {
+            return serve_runtime_initiated(config, tls, runtime);
         }
         let listener = ControlListener::bind(config)
             .map_err(|error| format!("bind boundary control listener: {error}"))?;
@@ -622,7 +639,6 @@ mod linux {
     /// TLS server and gRPC server roles are the same as for a listener.
     fn serve_runtime_initiated(
         config: &BoundaryListenerConfig,
-        addresses: Vec<std::net::SocketAddr>,
         tls: &openshell_sandbox_backend::boundary_protocol::SandboxTlsServerConfig,
         runtime: Arc<BoundaryRuntime>,
     ) -> Result<(), String> {
@@ -632,7 +648,7 @@ mod linux {
         );
         tracing::info!(?config, "Boundary control dialer ready");
         let dialer = runtime.process_runtime.spawn(run_runtime_initiated_control(
-            addresses,
+            config.clone(),
             server_config,
             runtime.clone(),
             Arc::new(AtomicUsize::new(0)),
@@ -655,7 +671,7 @@ mod linux {
     /// like accepted connections: same identity, slot limit, and disconnect,
     /// freeze, and termination handling.
     async fn run_runtime_initiated_control(
-        addresses: Vec<std::net::SocketAddr>,
+        config: BoundaryListenerConfig,
         server_config: Arc<rustls::ServerConfig>,
         runtime: Arc<BoundaryRuntime>,
         active_connections: Arc<AtomicUsize>,
@@ -663,16 +679,24 @@ mod linux {
         let mut backoff = RUNTIME_DIAL_BACKOFF_MIN;
         let mut warn_at: Option<tokio::time::Instant> = None;
         loop {
-            let established = match dial_supervisor(&addresses).await {
-                Ok(stream) => ControlStream::PendingTls {
-                    stream: PlainControlStream::Tcp(stream),
-                    server_config: server_config.clone(),
-                }
-                .establish_async(&runtime.process_runtime)
-                .await
-                .map_err(|error| format!("authenticate boundary transport: {error}")),
-                Err(error) => Err(format!("dial supervisor: {error}")),
-            };
+            let established =
+                match tokio::time::timeout(RUNTIME_DIAL_TIMEOUT, dial_supervisor(&config))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "supervisor dial timed out",
+                        ))
+                    }) {
+                    Ok(stream) => ControlStream::PendingTls {
+                        stream,
+                        server_config: server_config.clone(),
+                    }
+                    .establish_async(&runtime.process_runtime)
+                    .await
+                    .map_err(|error| format!("authenticate boundary transport: {error}")),
+                    Err(error) => Err(format!("dial supervisor: {error}")),
+                };
             let healthy = match established {
                 Ok(stream) => {
                     warn_at = None;
@@ -715,23 +739,47 @@ mod linux {
     }
 
     /// Dial only driver-provided supervisor addresses from the bootstrap.
-    async fn dial_supervisor(
-        addresses: &[std::net::SocketAddr],
-    ) -> io::Result<std::net::TcpStream> {
-        let stream = tokio::time::timeout(
-            RUNTIME_DIAL_TIMEOUT,
-            openshell_core::net::connect_tcp_nodelay_best_effort(addresses),
-        )
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "supervisor dial timed out"))??;
-        // An idle spare must notice a silently lost supervisor well inside the
-        // authenticated recovery window.
-        let keepalive = socket2::TcpKeepalive::new()
-            .with_time(Duration::from_secs(10))
-            .with_interval(Duration::from_secs(5))
-            .with_retries(3);
-        let _ = socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive);
-        stream.into_std()
+    async fn dial_supervisor(config: &BoundaryListenerConfig) -> io::Result<PlainControlStream> {
+        match config {
+            BoundaryListenerConfig::RuntimeInitiatedTlsTcp { addresses, .. } => {
+                let stream =
+                    openshell_core::net::connect_tcp_nodelay_best_effort(addresses).await?;
+                let keepalive = socket2::TcpKeepalive::new()
+                    .with_time(Duration::from_secs(10))
+                    .with_interval(Duration::from_secs(5))
+                    .with_retries(3);
+                let _ = socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive);
+                Ok(PlainControlStream::Tcp(stream.into_std()?))
+            }
+            BoundaryListenerConfig::RuntimeInitiatedUnix { socket_path, .. } => {
+                Ok(PlainControlStream::Unix(
+                    tokio::net::UnixStream::connect(socket_path)
+                        .await?
+                        .into_std()?,
+                ))
+            }
+            BoundaryListenerConfig::RuntimeInitiatedVsock { host_port, .. } => {
+                let socket =
+                    socket2::Socket::new(socket2::Domain::VSOCK, socket2::Type::STREAM, None)?;
+                socket.set_nonblocking(true)?;
+                match socket.connect(&socket2::SockAddr::vsock(libc::VMADDR_CID_HOST, *host_port)) {
+                    Ok(()) => {}
+                    Err(error) if error.raw_os_error() == Some(libc::EINPROGRESS) => {}
+                    Err(error) => return Err(error),
+                }
+                let stream =
+                    tokio::net::UnixStream::from_std(std::os::unix::net::UnixStream::from(socket))?;
+                stream.writable().await?;
+                if let Some(error) = stream.take_error()? {
+                    return Err(error);
+                }
+                Ok(PlainControlStream::Unix(stream.into_std()?))
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "control transport does not dial",
+            )),
+        }
     }
 
     /// Signals once the supervisor sends its first application bytes.
@@ -3607,7 +3655,9 @@ mod linux {
                         server_config,
                     })
                 }
-                BoundaryListenerConfig::RuntimeInitiatedTlsTcp { .. } => Err(io::Error::new(
+                BoundaryListenerConfig::RuntimeInitiatedTlsTcp { .. }
+                | BoundaryListenerConfig::RuntimeInitiatedUnix { .. }
+                | BoundaryListenerConfig::RuntimeInitiatedVsock { .. } => Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "runtime-initiated control dials the supervisor and binds no listener",
                 )),

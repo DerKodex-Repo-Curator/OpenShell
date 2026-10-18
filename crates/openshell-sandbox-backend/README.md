@@ -119,3 +119,8 @@ open, so reconnects and credential rotation never wait for a new dial.
 
 The new variants leave existing encodings unchanged. Binaries that predate them
 reject runtime-initiated descriptors instead of falling back to another mode.
+
+Runtime-initiated transport supports TCP, protected Unix sockets, and host
+vsock listeners. These share bounded TLS handshakes, the authenticated spare
+queue, and the same generation-pinned runtime identity check. The legacy
+supervisor-dialed transports remain available for existing descriptors.
