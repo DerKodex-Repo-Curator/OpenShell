@@ -102,6 +102,10 @@ retain generation, session, resource, identity, and provisioning evidence checks
 
 ## Boundary transport establishment
 
+`SandboxTransport` belongs to this backend's runtime descriptor. Core retains
+only operator-registered endpoints; `DelegatedLaunch` converts those endpoints
+into the backend's transport without changing their serialized representation.
+
 The supervisor chooses one `BoundaryTransport` per runtime descriptor and uses
 clones of it for policy discovery and attachment. It dials the descriptor's
 endpoint, uses a backend-supplied `BoundaryTransportConnector` for raw stream
