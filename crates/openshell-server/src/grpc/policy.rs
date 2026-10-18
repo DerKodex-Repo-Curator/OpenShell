@@ -2543,20 +2543,12 @@ async fn validate_provider_composition_for_existing_sandboxes(
                 current_base_policy_for_sandbox(state.store.as_ref(), &sandbox).await?;
             // A provider deleted under a sandbox leaves a dangling reference. The
             // sandbox already fails closed, so warn and validate the rest.
-            let mut records = Vec::with_capacity(provider_names.len());
-            let mut missing = Vec::new();
-            for name in provider_names {
-                match super::provider::load_provider_environment_record(
-                    state.store.as_ref(),
-                    &workspace,
-                    name,
-                )
-                .await?
-                {
-                    Some(record) => records.push(record),
-                    None => missing.push(name.as_str()),
-                }
-            }
+            let (records, missing) = super::provider::load_existing_provider_environment_records(
+                state.store.as_ref(),
+                &workspace,
+                provider_names,
+            )
+            .await?;
             if !missing.is_empty() {
                 warn!(
                     workspace = %workspace,
@@ -22626,14 +22618,69 @@ mod tests {
     async fn startup_preflight_still_rejects_invalid_policy_beside_dangling_reference() {
         let state = test_server_state().await;
         install_dangling_provider_sandbox(&state).await;
-        install_ambiguous_provider_binding(&state, "beside-dangling").await;
+        // Sorts after `sandbox-dangling`, so the dangling sandbox is checked first.
+        install_ambiguous_provider_binding(&state, "z-beside-dangling").await;
 
         let error = validate_provider_composition_startup_preflight(&state)
             .await
             .expect_err("an invalid composed policy must stay fatal");
 
         assert_eq!(error.code(), Code::FailedPrecondition);
-        assert!(error.message().contains("sandbox-beside-dangling"));
+        assert!(error.message().contains("sandbox-z-beside-dangling"));
+    }
+
+    #[tokio::test]
+    async fn startup_preflight_validates_providers_beside_dangling_reference_on_one_sandbox() {
+        let state = test_server_state().await;
+        install_ambiguous_provider_binding(&state, "mixed").await;
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sandbox-mixed",
+                "sandbox-mixed",
+                test_policy_with_rule("base", "api.example.com"),
+                vec!["deleted-provider".to_string(), "provider-mixed".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let error = validate_provider_composition_startup_preflight(&state)
+            .await
+            .expect_err("a dangling reference must not skip the sandbox's other providers");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("sandbox-mixed"));
+    }
+
+    #[tokio::test]
+    async fn deleting_global_policy_tolerates_dangling_provider_reference() {
+        let state = test_server_state().await;
+        install_dangling_provider_sandbox(&state).await;
+
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                policy: Some(test_policy_with_rule("global", "global.example.com")),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("global policy should suppress provider composition");
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                setting_key: POLICY_SETTING_KEY.to_string(),
+                delete_setting: true,
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("a dangling provider reference must not block global policy deletion");
+
+        let settings = load_global_settings(state.store.as_ref()).await.unwrap();
+        assert!(!settings.settings.contains_key(POLICY_SETTING_KEY));
     }
 
     #[test]

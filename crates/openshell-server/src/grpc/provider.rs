@@ -1028,7 +1028,7 @@ pub(super) async fn resolve_provider_environment_with_credentials(
 }
 
 /// Loads one provider; `Ok(None)` means it does not exist.
-pub(super) async fn load_provider_environment_record(
+async fn load_provider_environment_record(
     store: &Store,
     workspace: &str,
     name: &str,
@@ -1053,18 +1053,59 @@ pub(super) async fn load_provider_environment_record(
     }))
 }
 
+/// Loads providers concurrently, in `provider_names` order; a missing
+/// provider is `None`. Store errors short-circuit.
+async fn load_optional_provider_environment_records(
+    store: &Store,
+    workspace: &str,
+    provider_names: &[String],
+) -> Result<Vec<Option<ProviderEnvironmentRecord>>, Status> {
+    // Providers are independent, so load them concurrently.
+    futures::future::try_join_all(
+        provider_names
+            .iter()
+            .map(|name| load_provider_environment_record(store, workspace, name)),
+    )
+    .await
+}
+
 pub(super) async fn load_provider_environment_records(
     store: &Store,
     workspace: &str,
     provider_names: &[String],
 ) -> Result<Vec<ProviderEnvironmentRecord>, Status> {
-    // Providers are independent, so load them concurrently.
-    futures::future::try_join_all(provider_names.iter().map(|name| async move {
-        load_provider_environment_record(store, workspace, name)
+    load_optional_provider_environment_records(store, workspace, provider_names)
+        .await?
+        .into_iter()
+        .zip(provider_names)
+        .map(|(record, name)| {
+            record
+                .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))
+        })
+        .collect()
+}
+
+/// Like [`load_provider_environment_records`], but returns the names of
+/// missing providers instead of failing.
+pub(super) async fn load_existing_provider_environment_records<'a>(
+    store: &Store,
+    workspace: &str,
+    provider_names: &'a [String],
+) -> Result<(Vec<ProviderEnvironmentRecord>, Vec<&'a str>), Status> {
+    let mut records = Vec::with_capacity(provider_names.len());
+    let mut missing = Vec::new();
+    for (record, name) in
+        load_optional_provider_environment_records(store, workspace, provider_names)
             .await?
-            .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))
-    }))
-    .await
+            .into_iter()
+            .zip(provider_names)
+    {
+        match record {
+            Some(record) => records.push(record),
+            None => missing.push(name.as_str()),
+        }
+    }
+    Ok((records, missing))
 }
 
 #[cfg(test)]
