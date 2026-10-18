@@ -112,7 +112,7 @@ LSM decisions remain authoritative.
 | In-memory `/run/openshell-supervisor-ca` tmpfs | Holds only the public supervisor CA certificate and trust bundle without making all of `/run` writable. |
 | CDI GPU request | Assigns the exact validated CDI devices requested by driver config or count-based selection. |
 
-New containers dial the supervisor at `/.openshell/channel/control/control.sock`.
+New containers dial the supervisor at `/.openshell/channel/control/supervisor/control.sock`.
 The runtime remains the TLS/gRPC server; the supervisor verifies its pinned
 identity and supplies the existing bearer credential. Saved descriptors retain
 the legacy Unix listener for existing containers, including across restart.

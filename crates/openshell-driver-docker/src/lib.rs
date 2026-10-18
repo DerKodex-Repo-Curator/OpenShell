@@ -108,7 +108,7 @@ const SUPERVISOR_GID: u32 = 65_534;
 const BOUNDARY_MOUNT_PATH: &str = "/.openshell/channel";
 const BOUNDARY_CONFIG_MOUNT_PATH: &str = "/.openshell/channel/sandbox/bootstrap.json";
 const BOUNDARY_CONTROL_MOUNT_PATH: &str = "/.openshell/channel/control";
-const BOUNDARY_SOCKET_MOUNT_PATH: &str = "/.openshell/channel/control/control.sock";
+const BOUNDARY_SOCKET_MOUNT_PATH: &str = "/.openshell/channel/control/supervisor/control.sock";
 const BOUNDARY_CERTIFICATE_MOUNT_PATH: &str = "/.openshell/channel/sandbox/server.crt";
 const BOUNDARY_PRIVATE_KEY_MOUNT_PATH: &str = "/.openshell/channel/sandbox/server.key";
 const SUPERVISOR_STATE_MOUNT_PATH: &str = "/.openshell/supervisor";
@@ -4577,35 +4577,6 @@ async fn stage_docker_sandbox_bundle(
         )
         .await
         .map_err(|error| Status::internal(format!("stage Docker sandbox bundle: {error}")))?;
-    let bootstrap: BoundaryConfig = serde_json::from_slice(boundary_config)
-        .map_err(|error| Status::internal(format!("decode Docker sandbox bootstrap: {error}")))?;
-    if matches!(
-        bootstrap.listener,
-        openshell_sandbox_backend::boundary_protocol::BoundaryListener::RuntimeInitiatedUnix { .. }
-    ) {
-        // Docker resolves an archive destination to one volume. Initialize the
-        // nested socket volume directly instead of writing into its shadowed
-        // mountpoint in the read-only bootstrap volume.
-        let mut archive = tar::Builder::new(Vec::new());
-        append_docker_archive_directory(&mut archive, ".", 0o711, SUPERVISOR_UID, SUPERVISOR_GID)?;
-        let bytes = archive
-            .into_inner()
-            .map_err(|error| Status::internal(format!("finish control volume archive: {error}")))?;
-        let options = UploadToContainerOptionsBuilder::default()
-            .path(BOUNDARY_CONTROL_MOUNT_PATH)
-            .copy_uidgid("true")
-            .build();
-        docker
-            .upload_to_container(
-                container_id,
-                Some(options),
-                bollard::body_full(Bytes::from(bytes)),
-            )
-            .await
-            .map_err(|error| {
-                Status::internal(format!("stage Docker control socket volume: {error}"))
-            })?;
-    }
     Ok(())
 }
 
@@ -5019,6 +4990,32 @@ async fn stage_docker_supervisor_bundle(
             Some(RemoveContainerOptionsBuilder::default().force(true).build()),
         )
         .await;
+    let runtime_initiated = read_docker_runtime_descriptor(&sandbox.id, config).await?
+        .is_some_and(|descriptor| matches!(descriptor.transport, openshell_sandbox_backend::boundary_protocol::SandboxTransport::RuntimeInitiatedUnix { .. }));
+    let mut mounts = vec![Mount {
+        target: Some(SUPERVISOR_STATE_MOUNT_PATH.to_string()),
+        source: Some(docker_supervisor_volume_name(sandbox, config)),
+        typ: Some(MountTypeEnum::VOLUME),
+        read_only: Some(false),
+        volume_options: Some(MountVolumeOptions {
+            no_copy: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+    if runtime_initiated {
+        mounts.push(Mount {
+            target: Some(BOUNDARY_CONTROL_MOUNT_PATH.to_string()),
+            source: Some(docker_control_volume_name_by_id(&sandbox.id, config)),
+            typ: Some(MountTypeEnum::VOLUME),
+            read_only: Some(false),
+            volume_options: Some(MountVolumeOptions {
+                no_copy: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
     let created = docker
         .create_container(
             Some(
@@ -5040,17 +5037,7 @@ async fn stage_docker_supervisor_bundle(
                 )),
                 host_config: Some(HostConfig {
                     network_mode: Some("none".to_string()),
-                    mounts: Some(vec![Mount {
-                        target: Some(SUPERVISOR_STATE_MOUNT_PATH.to_string()),
-                        source: Some(docker_supervisor_volume_name(sandbox, config)),
-                        typ: Some(MountTypeEnum::VOLUME),
-                        read_only: Some(false),
-                        volume_options: Some(MountVolumeOptions {
-                            no_copy: Some(true),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }]),
+                    mounts: Some(mounts),
                     cap_drop: Some(vec!["ALL".to_string()]),
                     security_opt: Some(vec!["no-new-privileges:true".to_string()]),
                     ..Default::default()
@@ -5068,14 +5055,50 @@ async fn stage_docker_supervisor_bundle(
         .path(SUPERVISOR_STATE_MOUNT_PATH)
         .copy_uidgid("true")
         .build();
-    let result = docker
-        .upload_to_container(
-            &created.id,
-            Some(options),
-            bollard::body_full(Bytes::from(archive)),
-        )
-        .await
-        .map_err(|error| Status::internal(format!("stage Docker supervisor bundle: {error}")));
+    let result: Result<(), Status> = async {
+        docker
+            .upload_to_container(
+                &created.id,
+                Some(options),
+                bollard::body_full(Bytes::from(archive)),
+            )
+            .await
+            .map_err(|error| {
+                Status::internal(format!("stage Docker supervisor bundle: {error}"))
+            })?;
+        if runtime_initiated {
+            // Initialize the socket volume using the supervisor's staging user.
+            // Docker preserves the existing volume root's ownership, so use
+            // a child directory created by the supervisor's staging user.
+            let mut archive = tar::Builder::new(Vec::new());
+            append_docker_archive_directory(
+                &mut archive,
+                "supervisor",
+                0o711,
+                SUPERVISOR_UID,
+                SUPERVISOR_GID,
+            )?;
+            let bytes = archive.into_inner().map_err(|error| {
+                Status::internal(format!("finish control socket archive: {error}"))
+            })?;
+            let options = UploadToContainerOptionsBuilder::default()
+                .path(BOUNDARY_CONTROL_MOUNT_PATH)
+                .copy_uidgid("true")
+                .build();
+            docker
+                .upload_to_container(
+                    &created.id,
+                    Some(options),
+                    bollard::body_full(Bytes::from(bytes)),
+                )
+                .await
+                .map_err(|error| {
+                    Status::internal(format!("stage Docker control socket volume: {error}"))
+                })?;
+        }
+        Ok(())
+    }
+    .await;
     let cleanup = docker
         .remove_container(
             &created.id,
