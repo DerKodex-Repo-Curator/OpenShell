@@ -379,7 +379,7 @@ async fn run_session_loop(config: SessionConfig) {
             Ok(SessionOutcome::Closed) => {
                 config.ready_tx.send_replace(false);
                 let event =
-                    session_closed_event(openshell_ocsf::ctx::ctx(), &target, &config.sandbox_id);
+                    session_closed_event(&openshell_ocsf::ctx::ctx(), &target, &config.sandbox_id);
                 ocsf_emit!(event);
                 break;
             }
@@ -401,7 +401,7 @@ async fn run_session_loop(config: SessionConfig) {
             Err(e) => {
                 let accepted = config.ready_tx.send_replace(false);
                 let event = session_failed_event(
-                    openshell_ocsf::ctx::ctx(),
+                    &openshell_ocsf::ctx::ctx(),
                     &target,
                     attempt,
                     &e.to_string(),
@@ -559,7 +559,7 @@ async fn run_single_session(
         updates.send_replace(Some(accepted.session_id.clone()));
     }
     let event = session_established_event(
-        openshell_ocsf::ctx::ctx(),
+        &openshell_ocsf::ctx::ctx(),
         target,
         &accepted.session_id,
         u32::try_from(heartbeat_secs).unwrap_or(u32::MAX),
@@ -703,7 +703,8 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
             let expected_ssh_peer_pid = context.expected_ssh_peer_pid;
             let terminating = Arc::clone(context.terminating);
 
-            let event = relay_open_event(openshell_ocsf::ctx::ctx(), &relay_open, &ssh_socket_path);
+            let event =
+                relay_open_event(&openshell_ocsf::ctx::ctx(), &relay_open, &ssh_socket_path);
             ocsf_emit!(event);
 
             tokio::spawn(async move {
@@ -721,7 +722,7 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
                 {
                     Ok(()) => {
                         let event = relay_closed_event(
-                            openshell_ocsf::ctx::ctx(),
+                            &openshell_ocsf::ctx::ctx(),
                             &event_open,
                             &ssh_socket_path,
                         );
@@ -729,7 +730,7 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
                     }
                     Err(e) => {
                         let event = relay_failed_event(
-                            openshell_ocsf::ctx::ctx(),
+                            &openshell_ocsf::ctx::ctx(),
                             &event_open,
                             &ssh_socket_path,
                             &e.to_string(),
@@ -747,7 +748,7 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
         }
         Some(gateway_message::Payload::RelayClose(close)) => {
             let event = relay_close_from_gateway_event(
-                openshell_ocsf::ctx::ctx(),
+                &openshell_ocsf::ctx::ctx(),
                 &close.channel_id,
                 &close.reason,
             );
