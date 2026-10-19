@@ -196,6 +196,11 @@ spec:
           mountPath: {{ dir $spiffeSocketPath | quote }}
           readOnly: true
         {{- end }}
+        {{- if include "openshell.experimentalSupervisorEnabled" . }}
+        - name: experimental-supervisor-control
+          mountPath: /etc/openshell-tls/experimental-supervisor-control
+          readOnly: true
+        {{- end }}
         {{- with .Values.server.extraVolumeMounts }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -289,6 +294,12 @@ spec:
         items:
           - key: ca.crt
             path: ca.crt
+    {{- end }}
+    {{- if include "openshell.experimentalSupervisorEnabled" . }}
+    # Admission credential for the shared supervisor's session-control API.
+    - name: experimental-supervisor-control
+      secret:
+        secretName: {{ include "openshell.experimentalSupervisorName" . }}-control-client
     {{- end }}
     {{- if .Values.upstreamProxy.caBundle.configMapName }}
     - name: upstream-proxy-ca
