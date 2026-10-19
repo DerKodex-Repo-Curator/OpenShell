@@ -24,6 +24,7 @@ mod endpoint_status;
 mod mechanistic_mapper;
 mod provider_readiness;
 pub mod session_host;
+pub mod shared_host;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::future::Future;
