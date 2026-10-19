@@ -202,12 +202,73 @@ pub enum ExperimentalSupervisorTopology {
     Workspace,
 }
 
+/// Connection to the supervisor Helm deploys for the gateway topology.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExperimentalSharedSupervisorConfig {
+    /// Service selecting the shared supervisor Pod.
+    pub service_name: String,
+    pub service_namespace: String,
+    /// Service port for runtime-initiated Sandbox Protocol connections.
+    pub runtime_port: u16,
+    /// Service port for the mutually authenticated session-control API.
+    pub control_port: u16,
+    /// Directory with the session-control client `tls.crt` and `tls.key` and
+    /// the CA `ca.crt` that issued the supervisor's certificate.
+    pub control_tls_dir: String,
+}
+
+impl ExperimentalSharedSupervisorConfig {
+    fn validate(&self) -> Result<(), String> {
+        if !is_dns_label(&self.service_name) || !is_dns_label(&self.service_namespace) {
+            return Err(
+                "experimental_shared_supervisor service_name and service_namespace must be DNS labels"
+                    .into(),
+            );
+        }
+        if self.runtime_port == 0
+            || self.control_port == 0
+            || self.runtime_port == self.control_port
+        {
+            return Err(
+                "experimental_shared_supervisor runtime_port and control_port must be distinct and nonzero"
+                    .into(),
+            );
+        }
+        if !Path::new(&self.control_tls_dir).is_absolute() {
+            return Err("experimental_shared_supervisor control_tls_dir must be absolute".into());
+        }
+        Ok(())
+    }
+
+    /// DNS name in the supervisor's session-control certificate.
+    #[must_use]
+    pub fn service_host(&self) -> String {
+        format!("{}.{}.svc", self.service_name, self.service_namespace)
+    }
+}
+
+fn is_dns_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesComputeConfig {
-    /// Deploy an idle experimental supervisor through Helm. Does not route sessions.
+    /// Supervise new sandbox generations with one supervisor shared by the
+    /// gateway instead of a supervisor Pod per sandbox. Existing generations
+    /// keep the topology recorded when they started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experimental_supervisor_topology: Option<ExperimentalSupervisorTopology>,
+    /// Shared supervisor connection rendered by Helm with the gateway topology.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental_shared_supervisor: Option<ExperimentalSharedSupervisorConfig>,
     /// Permit caller-supplied driver JSON. Does not waive resource admission.
     pub allow_driver_config: bool,
     /// Operator-owned external attachment approval policy.
@@ -401,6 +462,7 @@ impl Default for KubernetesComputeConfig {
     fn default() -> Self {
         Self {
             experimental_supervisor_topology: None,
+            experimental_shared_supervisor: None,
             workspace_mode: WorkspaceMode::default(),
             allow_driver_config: false,
             resource_admission:
@@ -454,10 +516,7 @@ impl Default for KubernetesComputeConfig {
 impl KubernetesComputeConfig {
     /// Validate startup configuration without connecting to Kubernetes.
     pub fn validate_configuration(&self) -> Result<(), String> {
-        if self.experimental_supervisor_topology == Some(ExperimentalSupervisorTopology::Workspace)
-        {
-            return Err("experimental_supervisor_topology=workspace is not implemented".into());
-        }
+        self.validate_experimental_supervisor_topology()?;
         self.validate_workspace_mode()?;
         self.validate_provider_spiffe_workload_api_socket_path()?;
         self.validate_sandbox_identity_config()?;
@@ -465,6 +524,39 @@ impl KubernetesComputeConfig {
         self.validate_upstream_proxy_config()?;
         self.validate_allowed_pod_annotations()?;
         self.validate_allowed_pod_labels()
+    }
+
+    /// The shared supervisor serves only sessions it can isolate: it holds no
+    /// per-sandbox workload identity, upstream proxy credential, or proxy CA.
+    pub fn validate_experimental_supervisor_topology(&self) -> Result<(), String> {
+        match self.experimental_supervisor_topology {
+            None => {
+                if self.experimental_shared_supervisor.is_some() {
+                    return Err("experimental_shared_supervisor requires experimental_supervisor_topology=gateway".into());
+                }
+                Ok(())
+            }
+            Some(ExperimentalSupervisorTopology::Workspace) => {
+                Err("experimental_supervisor_topology=workspace is not implemented".into())
+            }
+            Some(ExperimentalSupervisorTopology::Gateway) => {
+                let shared = self.experimental_shared_supervisor.as_ref().ok_or_else(|| {
+                    "experimental_supervisor_topology=gateway requires experimental_shared_supervisor"
+                        .to_string()
+                })?;
+                shared.validate()?;
+                if self.provider_spiffe_enabled() {
+                    return Err("experimental_supervisor_topology=gateway does not support provider_spiffe_workload_api_socket_path; a shared supervisor has no per-sandbox workload identity".into());
+                }
+                if self.https_proxy.is_some()
+                    || self.proxy_auth_secret_name.is_some()
+                    || self.proxy_ca_bundle.is_some()
+                {
+                    return Err("experimental_supervisor_topology=gateway does not support upstream proxy settings".into());
+                }
+                Ok(())
+            }
+        }
     }
 
     pub fn validate_allowed_pod_annotations(&self) -> Result<(), String> {
@@ -1010,6 +1102,87 @@ fn validate_provider_spiffe_workload_api_socket_path_value(
 mod tests {
     use super::*;
     use std::collections::BTreeMap as HashMap;
+
+    #[test]
+    fn gateway_supervisor_topology_requires_its_connection_and_refuses_unsupported_inputs() {
+        let shared = || ExperimentalSharedSupervisorConfig {
+            service_name: "openshell-supervisor".to_string(),
+            service_namespace: "openshell".to_string(),
+            runtime_port: 8443,
+            control_port: 9443,
+            control_tls_dir: "/etc/openshell-tls/session-control".to_string(),
+        };
+        let gateway =
+            |shared: Option<ExperimentalSharedSupervisorConfig>| KubernetesComputeConfig {
+                experimental_supervisor_topology: Some(ExperimentalSupervisorTopology::Gateway),
+                experimental_shared_supervisor: shared,
+                ..KubernetesComputeConfig::default()
+            };
+        assert!(
+            gateway(Some(shared()))
+                .validate_experimental_supervisor_topology()
+                .is_ok()
+        );
+        assert!(
+            gateway(None)
+                .validate_experimental_supervisor_topology()
+                .is_err()
+        );
+        // The connection alone does not opt a gateway in.
+        let unset = KubernetesComputeConfig {
+            experimental_shared_supervisor: Some(shared()),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(unset.validate_experimental_supervisor_topology().is_err());
+        for invalid in [
+            ExperimentalSharedSupervisorConfig {
+                control_port: 8443,
+                ..shared()
+            },
+            ExperimentalSharedSupervisorConfig {
+                service_namespace: "Not_A_Label".to_string(),
+                ..shared()
+            },
+            ExperimentalSharedSupervisorConfig {
+                control_tls_dir: "relative".to_string(),
+                ..shared()
+            },
+        ] {
+            assert!(
+                gateway(Some(invalid))
+                    .validate_experimental_supervisor_topology()
+                    .is_err()
+            );
+        }
+        // A shared supervisor holds no per-sandbox workload identity or proxy credential.
+        let with_proxy = KubernetesComputeConfig {
+            https_proxy: Some("http://proxy.example:3128".to_string()),
+            ..gateway(Some(shared()))
+        };
+        assert!(
+            with_proxy
+                .validate_experimental_supervisor_topology()
+                .is_err()
+        );
+        let with_proxy_ca = KubernetesComputeConfig {
+            proxy_ca_bundle: Some("/etc/proxy/ca.pem".to_string()),
+            ..gateway(Some(shared()))
+        };
+        assert!(
+            with_proxy_ca
+                .validate_experimental_supervisor_topology()
+                .is_err()
+        );
+        let workspace = KubernetesComputeConfig {
+            experimental_supervisor_topology: Some(ExperimentalSupervisorTopology::Workspace),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(
+            workspace
+                .validate_experimental_supervisor_topology()
+                .is_err()
+        );
+    }
 
     #[test]
     fn image_pull_policy_accepts_config_and_kubernetes_spellings() {
