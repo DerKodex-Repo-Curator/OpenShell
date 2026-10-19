@@ -68,11 +68,16 @@ gatewayConfig:
     experimental_supervisor_topology: gateway
 ```
 
-The gateway chart creates a separate, single-replica idle supervisor Deployment
-in the release namespace, regardless of shared/managed/operator workspace mode.
-Use a supervisor image built from this branch: the bootstrap subcommand is new.
-Check its rollout and exec health probes separately; no sandbox sessions route
-through it. `workspace` is reserved and rejected. Omit the field to disable it.
+The gateway chart creates a single-replica shared supervisor Deployment,
+Service, and NetworkPolicy in the release namespace, regardless of
+shared/managed/operator workspace mode, and the certgen hook issues its
+session-control Secrets. New sandbox generations run as sessions in that
+process. Build the gateway, supervisor, and sandbox images from the same branch:
+all three must support the routed runtime connection. `workspace` is reserved
+and rejected. Omit the field to disable it. `mise run
+e2e:kubernetes:shared-supervisor` runs the focused e2e
+(`ci/values-experimental-supervisor.yaml`); layer a workspace-mode overlay
+through `OPENSHELL_E2E_KUBE_EXTRA_VALUES` to cover managed namespaces.
 
 ### 2. Deploy OpenShell
 

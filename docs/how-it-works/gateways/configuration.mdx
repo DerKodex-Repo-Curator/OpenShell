@@ -849,7 +849,8 @@ Kubernetes configurations set `namespace`, `service_account_name`, and `enable_u
 
 ### Kubernetes
 
-For experimental deployment plumbing, set
+To supervise new sandbox generations with one supervisor process shared by the
+gateway instead of a supervisor Pod per sandbox, set the experimental
 `[openshell.drivers.kubernetes].experimental_supervisor_topology = "gateway"`.
 With Helm, use the existing gateway configuration:
 
@@ -859,12 +860,30 @@ gatewayConfig:
     experimental_supervisor_topology: gateway
 ```
 
-The chart deploys one idle supervisor in the gateway namespace for all workspace
-modes (`shared`, `managed`, and `operator`). Its health checks report process
-health only. It does not accept sandbox sessions; sandboxes retain their dedicated
-supervisors. Omit the field to disable the experiment. The `workspace` value is
-reserved and currently returns an unsupported error. Helm owns this Deployment;
-setting the field in a standalone TOML file does not provision infrastructure.
+The chart deploys one supervisor replica and its Service in the gateway
+namespace for all workspace modes (`shared`, `managed`, and `operator`). It
+issues a private session-control certificate that only the gateway mounts and
+renders the matching `experimental_shared_supervisor` table into the gateway
+TOML; do not set that table yourself. Each new sandbox generation becomes a
+session on the shared supervisor that acts only with the credentials the
+gateway issued for that generation. Generations that started before the
+setting changed keep their recorded topology until they are stopped and started
+again.
+
+The shared supervisor is a single point of failure: when it restarts, the
+sessions it hosted end and reconciliation suspends their sandboxes, which you
+then start again. Removing the setting does the same for every shared sandbox,
+and starting one again gives it a dedicated supervisor. The gateway refuses the
+topology together with upstream proxy settings or provider SPIFFE identity. In
+`operator` workspace mode, the chart requires `operator_namespace_label` in
+`key=value` form, because the supervisor accepts runtime connections only from
+those namespaces. The `workspace` value is reserved and returns an unsupported
+error. Omit the field to disable the experiment. Outside
+Helm, `experimental_shared_supervisor` takes `service_name`,
+`service_namespace`, `runtime_port`, `control_port`, and `control_tls_dir`, a
+directory holding the session-control client `tls.crt` and `tls.key` and the
+`ca.crt` that issued the supervisor's certificate; you then deploy and secure
+the matching supervisor yourself.
 
 The gateway runs as a Pod and creates paired workload and supervisor Pods in another namespace. The gateway CA is projected from a Kubernetes Secret into supervisor Pods; user client certificate and key entries in that Secret are not exposed to either Pod.
 

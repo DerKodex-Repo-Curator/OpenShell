@@ -49,16 +49,40 @@ For local evaluation only, TLS may be disabled and the gateway can be reached th
 
 Use `openshell --help` and nested `--help` output as the authority for the installed CLI version. Use the published [installation guide](https://docs.nvidia.com/openshell/latest/about/installation.md), [compute-driver reference](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/runtimes), [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration), and [Kubernetes setup guide](https://docs.nvidia.com/openshell/latest/kubernetes/setup.md) as the authority for deployment and configuration behavior.
 
-## Experimental supervisor deployment
+## Experimental shared supervisor
 
 When the installed gateway configuration enables
 `[openshell.drivers.kubernetes].experimental_supervisor_topology = "gateway"`,
-Helm creates `<fullname>-experimental-supervisor` in the gateway namespace.
-Inspect that Deployment separately from per-sandbox supervisor Pods. This applies
-to shared, managed, and operator workspace modes. Its probes report idle process
-health, not sandbox session readiness; it does not serve sandboxes yet. Consult
-the published gateway configuration reference for the installed version. Omit
-the setting and upgrade the release to remove the experimental Deployment.
+Helm creates the Deployment, Service, and NetworkPolicy
+`<fullname>-experimental-supervisor` in the gateway namespace for every
+workspace mode. New sandbox generations run as sessions in that one process, so
+there are no per-sandbox supervisor Pods or `os-boundary-<id>` Services for
+them. Its probes report process health, not sandbox readiness.
+
+- A shared generation's Sandbox resource carries
+  `openshell.ai/sandbox-runtime-supervisor-topology: gateway` and its session
+  route in `openshell.ai/sandbox-runtime-supervisor-session`. Older generations
+  without them still use dedicated supervisor Pods.
+- Check the supervisor's logs and restarts with `kubectl -n <gateway-namespace>
+  logs deploy/<fullname>-experimental-supervisor`. A restart ends every hosted
+  session; reconciliation then suspends those sandboxes and users start them
+  again.
+- Each sandbox needs the egress allowance `os-shared-control-<id>` in its
+  namespace, and the CNI must enforce NetworkPolicy. A missing or modified
+  allowance suspends the workload.
+- The pre-install certgen hook creates `<fullname>-experimental-supervisor-control`
+  (mounted only by the supervisor) and `-control-client` (mounted only by the
+  gateway). Driver errors that mention session-control TLS point at these
+  Secrets. Delete both and upgrade the release to reissue them, then restart
+  the supervisor and gateway.
+- The gateway refuses this topology with upstream proxy settings or provider
+  SPIFFE identity. In operator workspace mode the chart requires
+  `operator_namespace_label` as `key=value`, because the supervisor's
+  NetworkPolicy admits runtime connections only from those namespaces.
+
+To leave the experiment, omit the setting and upgrade the release.
+Reconciliation suspends the sandboxes the shared supervisor hosted; start each
+one again to give it a dedicated supervisor.
 
 ## Workflow
 
