@@ -75,6 +75,9 @@ them. Its probes report process health, not sandbox readiness.
   gateway). Driver errors that mention session-control TLS point at these
   Secrets. Delete both and upgrade the release to reissue them, then restart
   the supervisor and gateway.
+- Shared sessions export no supervisor OTLP traces or OCSF events, even when the
+  gateway's `[openshell.gateway.otlp]` table configures them; use the sandbox
+  logs the gateway collects instead.
 - The gateway refuses this topology with upstream proxy settings or provider
   SPIFFE identity. In operator workspace mode the chart requires
   `operator_namespace_label` as `key=value`, because the supervisor's

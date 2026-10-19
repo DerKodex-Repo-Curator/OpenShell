@@ -877,7 +877,10 @@ and starting one again gives it a dedicated supervisor. The gateway refuses the
 topology together with upstream proxy settings or provider SPIFFE identity. In
 `operator` workspace mode, the chart requires `operator_namespace_label` in
 `key=value` form, because the supervisor accepts runtime connections only from
-those namespaces. The `workspace` value is reserved and returns an unsupported
+those namespaces. Shared sessions do not export supervisor traces or OCSF events
+to the `[openshell.gateway.otlp]` collectors that dedicated supervisors use; the
+gateway logs a warning when export is configured. Sandbox logs still reach the
+gateway. The `workspace` value is reserved and returns an unsupported
 error. Omit the field to disable the experiment. Outside
 Helm, `experimental_shared_supervisor` takes `service_name`,
 `service_namespace`, `runtime_port`, `control_port`, and `control_tls_dir`, a
