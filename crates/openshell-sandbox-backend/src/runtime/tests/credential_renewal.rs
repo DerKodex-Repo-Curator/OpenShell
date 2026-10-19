@@ -10,6 +10,8 @@ struct RenewingGrpcBoundary {
     expected_token: Arc<std::sync::RwLock<String>>,
     failures: Arc<std::sync::atomic::AtomicUsize>,
     failure_code: tonic::Code,
+    confirmation: Arc<std::sync::RwLock<BoundaryConfirmation>>,
+    attach_generation: Arc<std::sync::RwLock<String>>,
 }
 
 #[tonic::async_trait]
@@ -35,6 +37,8 @@ impl SandboxProtocol for RenewingGrpcBoundary {
         }
         let mut inner = self.inner.clone();
         inner.expected_token = self.expected_token.read().unwrap().clone();
+        inner.confirmation = self.confirmation.read().unwrap().clone();
+        inner.attach_generation = self.attach_generation.read().unwrap().clone();
         inner.exchange(request).await
     }
 
@@ -62,6 +66,7 @@ async fn renewing_boundary_client(
     let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let service = RenewingGrpcBoundary {
         inner: TestGrpcBoundary {
+            attach_generation: "test-generation".to_string(),
             wait_for_half_close: false,
             expected_token: "a".repeat(32),
             requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -73,6 +78,8 @@ async fn renewing_boundary_client(
         expected_token: Arc::new(std::sync::RwLock::new("a".repeat(32))),
         failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         failure_code,
+        confirmation: Arc::new(std::sync::RwLock::new(test_confirmation())),
+        attach_generation: Arc::new(std::sync::RwLock::new("test-generation".to_string())),
     };
     let server_service = service.clone();
     let server_accepted = accepted.clone();
@@ -247,5 +254,81 @@ async fn confirmation_authenticates_captured_bearer_after_slot_changes() {
     assert!(matches!(response, Response::Confirmed { .. }));
     assert_eq!(service.inner.requests.load(Ordering::Acquire), 3);
     assert_eq!(accepted.load(Ordering::Acquire), 1);
+    server.abort();
+}
+
+/// A backend that loses its launch state and answers for another session.
+fn confirm_another_session(service: &RenewingGrpcBoundary) {
+    service.confirmation.write().unwrap().session_id =
+        "550e8400-e29b-41d4-a716-446655440001".parse().unwrap();
+}
+
+#[tokio::test]
+async fn renewal_rejects_confirmation_for_another_session() {
+    let (client, service, accepted, server) =
+        renewing_boundary_client(tonic::Code::Unavailable).await;
+    let original = client.grpc_channel.lock().await.clone().unwrap();
+    confirm_another_session(&service);
+    let renewed_token = "b".repeat(32);
+    *service.expected_token.write().unwrap() = renewed_token.clone();
+    client
+        .sandbox_bearer
+        .update(
+            SecretJwt::parse(renewed_token).unwrap(),
+            i64::MAX,
+            openshell_core::jwt::CredentialEpoch::new(1).unwrap(),
+        )
+        .unwrap();
+
+    let result = client.ensure_current_credential_connection().await;
+    assert!(
+        matches!(&result, Err(BackendError::Confirm(message)) if message.contains("session")),
+        "renewal must reject a confirmation for another session: {result:?}"
+    );
+    let failed = client.grpc_channel.lock().await.clone().unwrap();
+    assert_eq!(failed.bearer_fingerprint, original.bearer_fingerprint);
+    assert!(
+        failed.transport.is_aborted(),
+        "a mismatched renewal must close the connection's live streams"
+    );
+    assert_eq!(accepted.load(Ordering::Acquire), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn reconnect_rejects_confirmation_for_another_session() {
+    let (client, service, accepted, server) =
+        renewing_boundary_client(tonic::Code::Unavailable).await;
+    confirm_another_session(&service);
+
+    // The liveness probe must not keep the connection, and the replacement
+    // connection's replayed Confirm must not be accepted either.
+    let result = client
+        .recover_after_unavailable(client.connection_generation().await)
+        .await;
+    assert!(
+        matches!(&result, Err(BackendError::Confirm(message)) if message.contains("session")),
+        "reconnect must reject a confirmation for another session: {result:?}"
+    );
+    assert_eq!(accepted.load(Ordering::Acquire), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn reconnect_rejects_attach_for_another_generation() {
+    let (client, service, accepted, server) =
+        renewing_boundary_client(tonic::Code::Unavailable).await;
+    let cached = client.grpc_channel.lock().await.clone().unwrap();
+    cached.transport.abort();
+    *service.attach_generation.write().unwrap() = "other-generation".to_string();
+
+    let result = client
+        .recover_after_unavailable(client.connection_generation().await)
+        .await;
+    assert!(
+        matches!(&result, Err(BackendError::Confirm(message)) if message.contains("snapshot generation")),
+        "reconnect must reject an Attach for another generation: {result:?}"
+    );
+    assert_eq!(accepted.load(Ordering::Acquire), 2);
     server.abort();
 }
